@@ -121,6 +121,7 @@ pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
 pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
+pub(crate) const DEFAULT_WATCHDOG_INTERVAL_S: i64 = 60;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
@@ -360,6 +361,9 @@ pub struct Config {
     /// as a synthetic function_call/function_call_output pair instead of plain
     /// user input.
     pub agent_use_function_call_inbox: bool,
+
+    /// Watchdog polling interval in seconds.
+    pub watchdog_interval_s: i64,
 
     /// Maximum nesting depth allowed for spawned agent threads.
     pub agent_max_depth: i32,
@@ -1226,6 +1230,9 @@ pub struct ConfigToml {
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
 
+    /// Watchdog polling interval in seconds.
+    pub watchdog_interval_s: Option<i64>,
+
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
 
@@ -1398,12 +1405,24 @@ pub struct AgentsToml {
     pub roles: BTreeMap<String, AgentRoleToml>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRoleSpawnMode {
+    Spawn,
+    #[default]
+    Fork,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     /// Human-facing role documentation used in spawn tool guidance.
     pub description: Option<String>,
+    /// Optional model override applied by this role.
+    pub model: Option<String>,
     /// Path to a role-specific config layer.
     pub config_file: Option<PathBuf>,
+    /// Optional default spawn mode when `spawn_agent` omits `spawn_mode`.
+    pub spawn_mode: Option<AgentRoleSpawnMode>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
 }
@@ -1414,9 +1433,15 @@ pub struct AgentRoleToml {
     /// Human-facing role documentation used in spawn tool guidance.
     pub description: Option<String>,
 
+    /// Optional model override applied by this role.
+    pub model: Option<String>,
+
     /// Path to a role-specific config layer.
     /// Relative paths are resolved relative to the `config.toml` that defines them.
     pub config_file: Option<AbsolutePathBuf>,
+
+    /// Optional default spawn mode when `spawn_agent` omits `spawn_mode`.
+    pub spawn_mode: Option<AgentRoleSpawnMode>,
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
@@ -1913,7 +1938,9 @@ impl Config {
                             name.clone(),
                             AgentRoleConfig {
                                 description: role.description.clone(),
+                                model: role.model.clone(),
                                 config_file,
+                                spawn_mode: role.spawn_mode,
                                 nickname_candidates,
                             },
                         ))
@@ -1943,6 +1970,15 @@ impl Config {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "agents.job_max_runtime_seconds must fit within a 64-bit signed integer",
+            ));
+        }
+        let watchdog_interval_s = cfg
+            .watchdog_interval_s
+            .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_S);
+        if watchdog_interval_s <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "watchdog_interval_s must be at least 1",
             ));
         }
         let background_terminal_max_timeout = cfg
@@ -2190,6 +2226,7 @@ impl Config {
             memories: cfg.memories.unwrap_or_default().into(),
             agent_job_max_runtime_seconds,
             agent_use_function_call_inbox,
+            watchdog_interval_s,
             codex_home,
             sqlite_home,
             log_dir,
