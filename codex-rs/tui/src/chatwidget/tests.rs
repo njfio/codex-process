@@ -6996,10 +6996,12 @@ async fn experimental_popup_includes_guardian_approval() {
     chat.open_experimental_popup();
 
     let popup = render_bottom_popup(&chat, 120);
-    #[cfg(target_os = "linux")]
-    assert_snapshot!("experimental_popup_includes_guardian_approval_linux", popup);
-    #[cfg(not(target_os = "linux"))]
-    assert_snapshot!("experimental_popup_includes_guardian_approval", popup);
+    let snapshot_name = if cfg!(target_os = "linux") {
+        "experimental_popup_includes_guardian_approval_linux"
+    } else {
+        "experimental_popup_includes_guardian_approval"
+    };
+    assert_snapshot!(snapshot_name, popup);
 }
 
 #[tokio::test]
