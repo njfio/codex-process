@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;
@@ -30,6 +31,7 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
@@ -143,6 +145,9 @@ enum Subcommand {
     /// Internal: relay stdio to a Unix domain socket.
     #[clap(hide = true, name = "stdio-to-uds")]
     StdioToUds(StdioToUdsCommand),
+
+    /// [EXPERIMENTAL] Run process-mode orchestration commands.
+    Process(ProcessCli),
 
     /// Inspect feature flags.
     Features(FeaturesCli),
@@ -539,6 +544,81 @@ struct FeatureSetArgs {
     feature: String,
 }
 
+#[derive(Debug, Parser)]
+struct ProcessCli {
+    #[command(subcommand)]
+    sub: ProcessSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ProcessSubcommand {
+    /// Start a process-mode run and scaffold required artifacts.
+    Run(ProcessRunArgs),
+    /// Inspect a process-mode run by id, or the latest run if omitted.
+    Status(ProcessStatusArgs),
+    /// Ingest open PR comments from GitHub and scaffold response planning artifacts.
+    #[clap(name = "pr-comments")]
+    PrComments(ProcessPrCommentsArgs),
+    /// Watch open issues for process automation.
+    Issues(ProcessIssuesCli),
+}
+
+#[derive(Debug, Args)]
+struct ProcessRunArgs {
+    /// Task description for this run.
+    #[arg(long)]
+    task: String,
+}
+
+#[derive(Debug, Args)]
+struct ProcessStatusArgs {
+    /// Run id to inspect (defaults to latest run in .process/runs).
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProcessPrCommentsArgs {
+    /// Repository in owner/name format.
+    #[arg(long)]
+    repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pr: u64,
+
+    /// Triage comments and create follow-up issues for deferred work.
+    #[arg(long, default_value_t = false)]
+    act: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProcessIssuesCli {
+    #[command(subcommand)]
+    sub: ProcessIssuesSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ProcessIssuesSubcommand {
+    /// Fetch matching open issues and produce an automation action plan artifact.
+    Watch(ProcessIssuesWatchArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProcessIssuesWatchArgs {
+    /// Repository in owner/name format.
+    #[arg(long)]
+    repo: String,
+
+    /// Label to filter issues.
+    #[arg(long)]
+    label: String,
+
+    /// Max number of issues to fetch.
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+}
+
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
     use codex_core::features::Stage;
     match stage {
@@ -781,6 +861,22 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
         }
+        Some(Subcommand::Process(ProcessCli { sub })) => match sub {
+            ProcessSubcommand::Run(args) => {
+                run_process_mode(args)?;
+            }
+            ProcessSubcommand::Status(args) => {
+                process_mode_status(args)?;
+            }
+            ProcessSubcommand::PrComments(args) => {
+                process_mode_pr_comments(args)?;
+            }
+            ProcessSubcommand::Issues(ProcessIssuesCli { sub }) => match sub {
+                ProcessIssuesSubcommand::Watch(args) => {
+                    process_mode_issues_watch(args)?;
+                }
+            },
+        },
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 // Respect root-level `-c` overrides plus top-level flags like `--profile`.
@@ -834,6 +930,1498 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_process_mode(args: ProcessRunArgs) -> anyhow::Result<()> {
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let contract = serde_json::json!({
+        "run_id": run_id,
+        "state": "CONTRACT",
+        "task": args.task,
+        "status": "pending"
+    });
+    std::fs::write(
+        run_dir.join("contract.json"),
+        serde_json::to_string_pretty(&contract)?,
+    )?;
+
+    let red_proof = serde_json::json!({
+        "state": "RED",
+        "status": "pending",
+        "required": "capture failing test proof"
+    });
+    std::fs::write(
+        run_dir.join("red-proof.json"),
+        serde_json::to_string_pretty(&red_proof)?,
+    )?;
+
+    let verify = serde_json::json!({
+        "state": "VERIFY",
+        "status": "pending",
+        "required": ["lint", "tests"]
+    });
+    std::fs::write(
+        run_dir.join("verify.json"),
+        serde_json::to_string_pretty(&verify)?,
+    )?;
+
+    let traceability = serde_json::json!({
+        "state": "EVIDENCE",
+        "status": "pending",
+        "ac_to_tests_to_files": []
+    });
+    std::fs::write(
+        run_dir.join("traceability.json"),
+        serde_json::to_string_pretty(&traceability)?,
+    )?;
+
+    let summary = format!(
+        "# Process Run {run_id}\n\n- task: {}\n- state: INTAKE\n- status: bootstrapped\n",
+        contract["task"].as_str().unwrap_or_default()
+    );
+    std::fs::write(run_dir.join("summary.md"), summary)?;
+
+    println!("Process run bootstrapped: {run_id}");
+    println!("Artifacts: {}", run_dir.display());
+    Ok(())
+}
+
+fn process_mode_status(args: ProcessStatusArgs) -> anyhow::Result<()> {
+    let runs_dir = std::path::PathBuf::from(".process/runs");
+    let run_id = if let Some(run_id) = args.run_id {
+        run_id
+    } else {
+        let mut run_ids = std::fs::read_dir(&runs_dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        run_ids.sort();
+        run_ids
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("No process runs found in {}", runs_dir.display()))?
+    };
+
+    let run_dir = runs_dir.join(&run_id);
+    if !run_dir.exists() {
+        return Err(anyhow::anyhow!("Run not found: {}", run_dir.display()));
+    }
+
+    println!("Run: {run_id}");
+    println!("Directory: {}", run_dir.display());
+    for name in [
+        "contract.json",
+        "red-proof.json",
+        "verify.json",
+        "traceability.json",
+        "summary.md",
+    ] {
+        let path = run_dir.join(name);
+        let status = if path.exists() { "present" } else { "missing" };
+        println!("- {name}: {status}");
+    }
+    Ok(())
+}
+
+fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
+    let (owner, name) = parse_repo_owner_and_name(&args.repo)?;
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let unresolved_review_comments = fetch_unresolved_review_comments(&owner, &name, args.pr)
+        .with_context(|| {
+            format!(
+                "Failed to fetch unresolved review comments for {}#{}",
+                args.repo, args.pr
+            )
+        })?;
+    let open_issue_comments = fetch_issue_comments(&args.repo, args.pr).with_context(|| {
+        format!(
+            "Failed to fetch issue comments for {}#{}",
+            args.repo, args.pr
+        )
+    })?;
+    let grouped_by_type = GroupedByType {
+        unresolved_review_comments: unresolved_review_comments.len(),
+        open_issue_comments: open_issue_comments.len(),
+        total: unresolved_review_comments.len() + open_issue_comments.len(),
+    };
+    let suggested_next_actions = suggested_next_actions(&grouped_by_type);
+    let payload = ProcessPrCommentsArtifact {
+        repo: args.repo.clone(),
+        pr: args.pr,
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        unresolved_review_comments,
+        open_issue_comments,
+        grouped_by_type,
+        suggested_next_actions,
+    };
+    std::fs::write(
+        run_dir.join("pr-comments.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
+
+    if !args.act {
+        println!("PR comment response run created: {run_id}");
+        println!("Target: {}#{}", args.repo, args.pr);
+        println!("Artifact: {}", run_dir.join("pr-comments.json").display());
+        return Ok(());
+    }
+
+    let mut triage_items = payload
+        .unresolved_review_comments
+        .iter()
+        .map(|comment| ProcessCommentTriageItem {
+            source: "review_comment".to_string(),
+            comment_id: comment.id.clone(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            comment_url: comment.url.clone(),
+            decision: classify_comment_triage(&comment.body),
+            created_issue_url: None,
+            todo: None,
+            quick_fix_attempted: false,
+            quick_fix_success: None,
+            quick_fix_summary: None,
+            quick_fix_error: None,
+            quick_fix_branch: None,
+            quick_fix_commit_sha: None,
+            quick_fix_commit_url: None,
+        })
+        .collect::<Vec<_>>();
+    triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
+        ProcessCommentTriageItem {
+            source: "issue_comment".to_string(),
+            comment_id: comment.id.clone(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            comment_url: comment.url.clone(),
+            decision: classify_comment_triage(&comment.body),
+            created_issue_url: None,
+            todo: None,
+            quick_fix_attempted: false,
+            quick_fix_success: None,
+            quick_fix_summary: None,
+            quick_fix_error: None,
+            quick_fix_branch: None,
+            quick_fix_commit_sha: None,
+            quick_fix_commit_url: None,
+        }
+    }));
+
+    let mut grouped_by_decision = ProcessTriageCounts::default();
+    let mut created_issues = Vec::new();
+    let mut successful_quick_fixes = Vec::new();
+    let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
+    let quick_fix_root_error = std::fs::create_dir_all(&quick_fix_worktree_root)
+        .err()
+        .map(|err| {
+            format!(
+                "Unable to prepare quick-fix worktree directory {}: {err}",
+                quick_fix_worktree_root.display()
+            )
+        });
+    let quick_fix_base_sha = current_git_head_sha();
+    for item in &mut triage_items {
+        match item.decision {
+            TriageDecision::QuickFix => {
+                grouped_by_decision.quick_fix += 1;
+                let execution = if let Some(err) = &quick_fix_root_error {
+                    QuickFixExecutionResult {
+                        attempted: false,
+                        success: false,
+                        summary: None,
+                        error: Some(err.clone()),
+                        files: Vec::new(),
+                        verification: None,
+                        branch_name: None,
+                        commit_sha: None,
+                        commit_url: None,
+                    }
+                } else if let Ok(base_sha) = &quick_fix_base_sha {
+                    run_quick_fix_item_in_isolated_branch(
+                        &args.repo,
+                        args.pr,
+                        item,
+                        base_sha,
+                        &quick_fix_worktree_root,
+                    )
+                } else {
+                    QuickFixExecutionResult {
+                        attempted: false,
+                        success: false,
+                        summary: None,
+                        error: Some(format!(
+                            "Unable to read current git HEAD for quick-fix branching: {}",
+                            quick_fix_base_sha
+                                .as_ref()
+                                .err()
+                                .map_or_else(|| "unknown error".to_string(), ToString::to_string)
+                        )),
+                        files: Vec::new(),
+                        verification: None,
+                        branch_name: None,
+                        commit_sha: None,
+                        commit_url: None,
+                    }
+                };
+                let execution_summary = if execution.success {
+                    Some(
+                        execution
+                            .summary
+                            .clone()
+                            .unwrap_or_else(|| "Applied targeted quick fix.".to_string()),
+                    )
+                } else {
+                    execution.summary.clone()
+                };
+                item.quick_fix_attempted = execution.attempted;
+                item.quick_fix_success = Some(execution.success);
+                item.quick_fix_summary = execution_summary.clone();
+                item.quick_fix_error = execution.error.clone();
+                item.quick_fix_branch = execution.branch_name.clone();
+                item.quick_fix_commit_sha = execution.commit_sha.clone();
+                item.quick_fix_commit_url = execution.commit_url.clone();
+                if execution.success {
+                    let summary = execution_summary
+                        .unwrap_or_else(|| "Applied targeted quick fix.".to_string());
+                    successful_quick_fixes.push(QuickFixSummary {
+                        comment_id: item.comment_id.clone(),
+                        summary,
+                        files: execution.files,
+                        verification: execution.verification,
+                        commit_sha: execution.commit_sha,
+                        commit_url: execution.commit_url,
+                    });
+                } else {
+                    item.todo = Some(format!(
+                        "TODO: manual quick fix for comment {comment_id} ({comment_url})",
+                        comment_id = item.comment_id.as_str(),
+                        comment_url = item.comment_url.as_str()
+                    ));
+                }
+            }
+            TriageDecision::NeedsIssue => {
+                grouped_by_decision.needs_issue += 1;
+                let issue_url = create_follow_up_issue(
+                    &args.repo,
+                    args.pr,
+                    &item.author,
+                    &item.comment_url,
+                    &item.body,
+                )?;
+                item.created_issue_url = Some(issue_url.clone());
+                created_issues.push(ProcessCreatedIssue {
+                    source_comment_id: item.comment_id.clone(),
+                    source_comment_url: item.comment_url.clone(),
+                    issue_url,
+                });
+            }
+            TriageDecision::Question => {
+                grouped_by_decision.question += 1;
+            }
+        }
+    }
+    let pr_update_comment_url = if successful_quick_fixes.is_empty() {
+        None
+    } else {
+        post_quick_fix_pr_update_comment(&args.repo, args.pr, &successful_quick_fixes)?
+    };
+
+    let triage_artifact = ProcessPrCommentsTriageArtifact {
+        repo: args.repo.clone(),
+        pr: args.pr,
+        fetched_at: payload.fetched_at,
+        triage_items,
+        grouped_by_decision,
+        created_issues: created_issues.clone(),
+        pr_update_comment_url: pr_update_comment_url.clone(),
+    };
+    std::fs::write(
+        run_dir.join("triage.json"),
+        serde_json::to_string_pretty(&triage_artifact)?,
+    )?;
+
+    println!("PR comment action run created: {run_id}");
+    println!("Target: {}#{}", args.repo, args.pr);
+    println!("Ingested comments: {}", payload.grouped_by_type.total);
+    println!(
+        "Triage counts: quick_fix={}, needs_issue={}, question={}",
+        triage_artifact.grouped_by_decision.quick_fix,
+        triage_artifact.grouped_by_decision.needs_issue,
+        triage_artifact.grouped_by_decision.question
+    );
+    println!("Artifact: {}", run_dir.join("triage.json").display());
+    if created_issues.is_empty() {
+        println!("Created issue URLs: none");
+    } else {
+        println!("Created issue URLs:");
+        for issue in created_issues {
+            println!("- {}", issue.issue_url);
+        }
+    }
+    if let Some(url) = pr_update_comment_url {
+        println!("PR update comment URL: {url}");
+    } else {
+        println!("PR update comment URL: none");
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessPrCommentsArtifact {
+    repo: String,
+    pr: u64,
+    fetched_at: u64,
+    unresolved_review_comments: Vec<UnresolvedReviewComment>,
+    open_issue_comments: Vec<OpenIssueComment>,
+    grouped_by_type: GroupedByType,
+    suggested_next_actions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+struct UnresolvedReviewComment {
+    id: String,
+    author: String,
+    path: String,
+    line: Option<u64>,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+struct OpenIssueComment {
+    id: String,
+    author: String,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GroupedByType {
+    unresolved_review_comments: usize,
+    open_issue_comments: usize,
+    total: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TriageDecision {
+    QuickFix,
+    NeedsIssue,
+    Question,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessCommentTriageItem {
+    source: String,
+    comment_id: String,
+    author: String,
+    body: String,
+    comment_url: String,
+    decision: TriageDecision,
+    created_issue_url: Option<String>,
+    todo: Option<String>,
+    quick_fix_attempted: bool,
+    quick_fix_success: Option<bool>,
+    quick_fix_summary: Option<String>,
+    quick_fix_error: Option<String>,
+    quick_fix_branch: Option<String>,
+    quick_fix_commit_sha: Option<String>,
+    quick_fix_commit_url: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTriageCounts {
+    quick_fix: usize,
+    needs_issue: usize,
+    question: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessCreatedIssue {
+    source_comment_id: String,
+    source_comment_url: String,
+    issue_url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessPrCommentsTriageArtifact {
+    repo: String,
+    pr: u64,
+    fetched_at: u64,
+    triage_items: Vec<ProcessCommentTriageItem>,
+    grouped_by_decision: ProcessTriageCounts,
+    created_issues: Vec<ProcessCreatedIssue>,
+    pr_update_comment_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixExecutionResult {
+    attempted: bool,
+    success: bool,
+    summary: Option<String>,
+    error: Option<String>,
+    files: Vec<String>,
+    verification: Option<String>,
+    branch_name: Option<String>,
+    commit_sha: Option<String>,
+    commit_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixSummary {
+    comment_id: String,
+    summary: String,
+    files: Vec<String>,
+    verification: Option<String>,
+    commit_sha: Option<String>,
+    commit_url: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedQuickFixOutput {
+    summary: Option<String>,
+    files: Vec<String>,
+    verification: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessIssuesWatchArtifact {
+    fetched_at: u64,
+    repo: String,
+    label: String,
+    open_issues: Vec<ProcessWatchIssue>,
+    suggested_actions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessWatchIssue {
+    number: u64,
+    title: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlResponse {
+    data: Option<GhGraphQlData>,
+    errors: Option<Vec<GhGraphQlError>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlError {
+    message: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlData {
+    repository: Option<GhRepository>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GhPullRequest>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    review_threads: GhReviewThreadConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThreadConnection {
+    nodes: Vec<GhReviewThreadNode>,
+    page_info: GhPageInfo,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThreadNode {
+    is_resolved: bool,
+    comments: GhReviewCommentConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhReviewCommentConnection {
+    nodes: Vec<GhReviewCommentNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewCommentNode {
+    id: String,
+    author: Option<GhActor>,
+    path: String,
+    line: Option<u64>,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhActor {
+    login: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum GhIssueCommentsResponse {
+    Paged(Vec<Vec<GhIssueCommentNode>>),
+    Flat(Vec<GhIssueCommentNode>),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhIssueCommentNode {
+    id: u64,
+    body: String,
+    html_url: String,
+    user: GhIssueCommentUser,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhIssueCommentUser {
+    login: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhIssueListItem {
+    number: u64,
+    title: String,
+    url: String,
+}
+
+fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
+    };
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
+    }
+    Ok((owner.to_string(), name.to_string()))
+}
+
+fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()> {
+    parse_repo_owner_and_name(&args.repo)?;
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let issues =
+        fetch_open_issues_by_label(&args.repo, &args.label, args.limit).with_context(|| {
+            format!(
+                "Failed to fetch open issues for {} with label {}",
+                args.repo, args.label
+            )
+        })?;
+    let artifact = ProcessIssuesWatchArtifact {
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        repo: args.repo.clone(),
+        label: args.label.clone(),
+        suggested_actions: suggest_issue_watch_actions(&issues),
+        open_issues: issues,
+    };
+    std::fs::write(
+        run_dir.join("issues-watch.json"),
+        serde_json::to_string_pretty(&artifact)?,
+    )?;
+
+    println!("Issues watch run created: {run_id}");
+    println!("Target: {} [{}]", args.repo, args.label);
+    println!("Open issues fetched: {}", artifact.open_issues.len());
+    println!("Artifact: {}", run_dir.join("issues-watch.json").display());
+    Ok(())
+}
+
+fn fetch_unresolved_review_comments(
+    owner: &str,
+    name: &str,
+    pr: u64,
+) -> anyhow::Result<Vec<UnresolvedReviewComment>> {
+    const GRAPHQL_QUERY: &str = r#"query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        nodes {
+          isResolved
+          comments(first: 100) {
+            nodes {
+              id
+              author { login }
+              path
+              line
+              body
+              url
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}"#;
+
+    let mut unresolved_comments = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={GRAPHQL_QUERY}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("pr={pr}"),
+        ];
+        if let Some(cursor_value) = cursor.as_ref() {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor_value}"));
+        }
+
+        let page_json = run_gh_json_command(&args)?;
+        let parsed_page = parse_unresolved_review_comment_page(page_json)?;
+        unresolved_comments.extend(parsed_page.comments);
+
+        if !parsed_page.has_next_page {
+            break;
+        }
+        let Some(next_cursor) = parsed_page.end_cursor else {
+            anyhow::bail!(
+                "GitHub API returned pagination without a cursor for unresolved review comments."
+            );
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(unresolved_comments)
+}
+
+fn fetch_issue_comments(repo: &str, pr: u64) -> anyhow::Result<Vec<OpenIssueComment>> {
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/issues/{pr}/comments"),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+    ];
+    let issue_json = run_gh_json_command(&args)?;
+    parse_issue_comments(issue_json)
+}
+
+fn fetch_open_issues_by_label(
+    repo: &str,
+    label: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<ProcessWatchIssue>> {
+    let args = vec![
+        "issue".to_string(),
+        "list".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--state".to_string(),
+        "open".to_string(),
+        "--label".to_string(),
+        label.to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+        "--json".to_string(),
+        "number,title,url".to_string(),
+    ];
+    let issues_json = run_gh_json_command(&args)?;
+    let raw_items: Vec<GhIssueListItem> = serde_json::from_value(issues_json)
+        .context("Failed to parse GitHub issue list response")?;
+    Ok(raw_items
+        .into_iter()
+        .map(|issue| ProcessWatchIssue {
+            number: issue.number,
+            title: issue.title,
+            url: issue.url,
+        })
+        .collect())
+}
+
+fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
+    let output = std::process::Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `gh`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo/PR access.",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    serde_json::from_slice(&output.stdout).context("`gh` returned invalid JSON output")
+}
+
+fn run_gh_text_command(args: &[String]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `gh`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo access.",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("`gh` returned non-UTF8 output")?;
+    Ok(stdout.trim().to_string())
+}
+
+struct UnresolvedReviewCommentPage {
+    comments: Vec<UnresolvedReviewComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn parse_unresolved_review_comment_page(
+    page_json: serde_json::Value,
+) -> anyhow::Result<UnresolvedReviewCommentPage> {
+    let response: GhGraphQlResponse =
+        serde_json::from_value(page_json).context("Failed to parse GitHub GraphQL response")?;
+
+    if let Some(errors) = response.errors
+        && !errors.is_empty()
+    {
+        let messages = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("GitHub GraphQL returned errors: {messages}");
+    }
+
+    let review_threads = response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repo| repo.pull_request)
+        .map(|pr| pr.review_threads)
+        .ok_or_else(|| {
+            anyhow::anyhow!("GitHub GraphQL response did not include pull request review threads.")
+        })?;
+
+    let comments = review_threads
+        .nodes
+        .into_iter()
+        .filter(|thread| !thread.is_resolved)
+        .flat_map(|thread| thread.comments.nodes)
+        .map(|comment| UnresolvedReviewComment {
+            id: comment.id,
+            author: comment
+                .author
+                .map_or_else(|| "unknown".to_string(), |author| author.login),
+            path: comment.path,
+            line: comment.line,
+            body: comment.body,
+            url: comment.url,
+        })
+        .collect();
+
+    Ok(UnresolvedReviewCommentPage {
+        comments,
+        has_next_page: review_threads.page_info.has_next_page,
+        end_cursor: review_threads.page_info.end_cursor,
+    })
+}
+
+fn parse_issue_comments(issue_json: serde_json::Value) -> anyhow::Result<Vec<OpenIssueComment>> {
+    let response: GhIssueCommentsResponse = serde_json::from_value(issue_json)
+        .context("Failed to parse GitHub issue comments response")?;
+
+    let comments = match response {
+        GhIssueCommentsResponse::Paged(pages) => pages.into_iter().flatten().collect(),
+        GhIssueCommentsResponse::Flat(items) => items,
+    };
+
+    Ok(comments
+        .into_iter()
+        .map(|comment| OpenIssueComment {
+            id: comment.id.to_string(),
+            author: comment.user.login,
+            body: comment.body,
+            url: comment.html_url,
+        })
+        .collect())
+}
+
+fn classify_comment_triage(body: &str) -> TriageDecision {
+    let normalized = body.to_ascii_lowercase();
+    if [
+        "follow-up",
+        "follow up",
+        "separate issue",
+        "tracking issue",
+        "out of scope",
+        "later",
+        "future work",
+        "tech debt",
+        "defer",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return TriageDecision::NeedsIssue;
+    }
+
+    if [
+        "nit",
+        "typo",
+        "rename",
+        "format",
+        "formatting",
+        "small fix",
+        "quick fix",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return TriageDecision::QuickFix;
+    }
+
+    if normalized.contains('?')
+        || normalized.starts_with("why ")
+        || normalized.starts_with("what ")
+        || normalized.starts_with("can ")
+        || normalized.starts_with("could ")
+    {
+        return TriageDecision::Question;
+    }
+
+    TriageDecision::QuickFix
+}
+
+fn run_quick_fix_subprocess(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    work_dir: &std::path::Path,
+) -> QuickFixExecutionResult {
+    let prompt = build_quick_fix_prompt(repo, pr, item);
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            return QuickFixExecutionResult {
+                attempted: false,
+                success: false,
+                summary: None,
+                error: Some(format!(
+                    "Unable to locate current executable for quick-fix run: {err}"
+                )),
+                files: Vec::new(),
+                verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
+            };
+        }
+    };
+    let output = match std::process::Command::new(executable)
+        .args(["exec", "--skip-git-repo-check", "--full-auto", &prompt])
+        .current_dir(work_dir)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let error = if err.kind() == ErrorKind::NotFound {
+                "Unable to execute current binary for quick-fix run.".to_string()
+            } else {
+                format!("Failed to launch quick-fix subprocess: {err}")
+            };
+            return QuickFixExecutionResult {
+                attempted: true,
+                success: false,
+                summary: None,
+                error: Some(error),
+                files: Vec::new(),
+                verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed = parse_quick_fix_output(&stdout);
+    let summary = parsed
+        .summary
+        .or_else(|| first_non_empty_line(&stdout))
+        .or_else(|| first_non_empty_line(&stderr));
+
+    if output.status.success() {
+        return QuickFixExecutionResult {
+            attempted: true,
+            success: true,
+            summary,
+            error: None,
+            files: parsed.files,
+            verification: parsed.verification,
+            branch_name: None,
+            commit_sha: None,
+            commit_url: None,
+        };
+    }
+
+    let status = output.status.code().map_or_else(
+        || "terminated by signal".to_string(),
+        |code| code.to_string(),
+    );
+    let detail = first_non_empty_line(&stderr)
+        .or_else(|| first_non_empty_line(&stdout))
+        .unwrap_or_else(|| "subprocess returned no output".to_string());
+    QuickFixExecutionResult {
+        attempted: true,
+        success: false,
+        summary,
+        error: Some(format!(
+            "Quick-fix subprocess failed (status {status}): {detail}"
+        )),
+        files: parsed.files,
+        verification: parsed.verification,
+        branch_name: None,
+        commit_sha: None,
+        commit_url: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixCommitMetadata {
+    branch_name: String,
+    commit_sha: String,
+    commit_url: String,
+}
+
+fn run_quick_fix_item_in_isolated_branch(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    base_sha: &str,
+    worktree_root: &std::path::Path,
+) -> QuickFixExecutionResult {
+    let branch_name = quick_fix_branch_name(pr, &item.comment_id);
+    let worktree_dir = worktree_root.join(quick_fix_worktree_dir_name(&branch_name));
+    if let Err(err) = create_quick_fix_worktree(&worktree_dir, &branch_name, base_sha) {
+        return QuickFixExecutionResult {
+            attempted: false,
+            success: false,
+            summary: None,
+            error: Some(format!(
+                "Unable to create isolated worktree for quick-fix item {comment_id}: {err}",
+                comment_id = item.comment_id
+            )),
+            files: Vec::new(),
+            verification: None,
+            branch_name: Some(branch_name),
+            commit_sha: None,
+            commit_url: None,
+        };
+    }
+
+    let mut execution = run_quick_fix_subprocess(repo, pr, item, &worktree_dir);
+    execution.branch_name = Some(branch_name.clone());
+    if !execution.success {
+        return execution;
+    }
+
+    match commit_quick_fix_changes(repo, pr, item, &branch_name, &worktree_dir) {
+        Ok(metadata) => {
+            execution.branch_name = Some(metadata.branch_name);
+            execution.commit_sha = Some(metadata.commit_sha);
+            execution.commit_url = Some(metadata.commit_url);
+            execution
+        }
+        Err(err) => {
+            execution.success = false;
+            execution.error = Some(format!(
+                "Quick-fix commit step failed for comment {comment_id}: {err}",
+                comment_id = item.comment_id
+            ));
+            execution.commit_sha = None;
+            execution.commit_url = None;
+            execution
+        }
+    }
+}
+
+fn create_quick_fix_worktree(
+    worktree_dir: &std::path::Path,
+    branch_name: &str,
+    base_sha: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = worktree_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let args = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "-b".to_string(),
+        branch_name.to_string(),
+        worktree_dir.display().to_string(),
+        base_sha.to_string(),
+    ];
+    run_git_text_command(&args).map(|_| ())
+}
+
+fn commit_quick_fix_changes(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    branch_name: &str,
+    worktree_dir: &std::path::Path,
+) -> anyhow::Result<QuickFixCommitMetadata> {
+    let add_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "add".to_string(),
+        "-A".to_string(),
+    ];
+    run_git_text_command(&add_args)?;
+
+    let has_changes = git_has_staged_changes(worktree_dir)?;
+    if !has_changes {
+        anyhow::bail!("no changes were produced to commit");
+    }
+
+    let commit_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "commit".to_string(),
+        "-m".to_string(),
+        quick_fix_commit_message(pr, &item.comment_id),
+    ];
+    run_git_text_command(&commit_args)?;
+
+    let sha_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "rev-parse".to_string(),
+        "HEAD".to_string(),
+    ];
+    let commit_sha = run_git_text_command(&sha_args)?;
+
+    Ok(QuickFixCommitMetadata {
+        branch_name: branch_name.to_string(),
+        commit_url: quick_fix_commit_url(repo, &commit_sha),
+        commit_sha,
+    })
+}
+
+fn current_git_head_sha() -> anyhow::Result<String> {
+    let args = vec!["rev-parse".to_string(), "HEAD".to_string()];
+    run_git_text_command(&args)
+}
+
+fn git_has_staged_changes(worktree_dir: &std::path::Path) -> anyhow::Result<bool> {
+    let worktree = worktree_dir.display().to_string();
+    let output = std::process::Command::new("git")
+        .args(["-C", &worktree, "diff", "--cached", "--quiet"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "git is not available in PATH. Install git before running process quick-fix actions."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `git`: {err}")
+            }
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let details = if !stderr.is_empty() { stderr } else { stdout };
+            anyhow::bail!("`git diff --cached --quiet` failed: {}", details);
+        }
+    }
+}
+
+fn run_git_text_command(args: &[String]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!("git is not available in PATH.")
+            } else {
+                anyhow::anyhow!("Failed to start `git`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`git {}` failed with status {}: {}",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("`git` returned non-UTF8 output")?;
+    Ok(stdout.trim().to_string())
+}
+
+fn quick_fix_commit_message(pr: u64, comment_id: &str) -> String {
+    format!("process: quick fix for PR #{pr} comment {comment_id}")
+}
+
+fn quick_fix_commit_url(repo: &str, sha: &str) -> String {
+    format!("https://github.com/{repo}/commit/{sha}")
+}
+
+fn quick_fix_branch_name(pr: u64, comment_id: &str) -> String {
+    let short = short_comment_id_for_branch(comment_id);
+    format!("process/quick-fix-pr-{pr}-{short}")
+}
+
+fn quick_fix_worktree_dir_name(branch_name: &str) -> String {
+    branch_name.replace('/', "__")
+}
+
+fn short_comment_id_for_branch(comment_id: &str) -> String {
+    let mut short = String::new();
+    let mut last_was_dash = false;
+    for ch in comment_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            short.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !short.is_empty() {
+            short.push('-');
+            last_was_dash = true;
+        }
+        if short.len() >= 24 {
+            break;
+        }
+    }
+    while short.ends_with('-') {
+        short.pop();
+    }
+    if short.is_empty() {
+        return "comment".to_string();
+    }
+    short
+}
+
+fn build_quick_fix_prompt(repo: &str, pr: u64, item: &ProcessCommentTriageItem) -> String {
+    let trimmed_body = item.body.trim();
+    let bounded_body = trimmed_body.chars().take(2_000).collect::<String>();
+    format!(
+        "You are applying a minimal targeted fix in this repository.\n\nRepository: {repo}\nPR number: {pr}\nComment URL: {comment_url}\nComment body:\n{comment_body}\n\nRequirements:\n- Apply the smallest safe change that addresses the comment.\n- Keep scope tight to this comment only.\n- If verification is quick, run only focused checks.\n- Return exactly these lines at the end:\nSUMMARY: <one-line summary>\nFILES: <comma-separated file paths or none>\nVERIFICATION: <short status or none>",
+        comment_url = item.comment_url,
+        comment_body = bounded_body,
+    )
+}
+
+fn parse_quick_fix_output(output: &str) -> ParsedQuickFixOutput {
+    let mut parsed = ParsedQuickFixOutput::default();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(summary) = trimmed.strip_prefix("SUMMARY:") {
+            let summary = summary.trim();
+            if !summary.is_empty() {
+                parsed.summary = Some(summary.to_string());
+            }
+            continue;
+        }
+        if let Some(files) = trimmed.strip_prefix("FILES:") {
+            let files = files.trim();
+            if !files.eq_ignore_ascii_case("none") && !files.is_empty() {
+                parsed.files = files
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+            continue;
+        }
+        if let Some(verification) = trimmed.strip_prefix("VERIFICATION:") {
+            let verification = verification.trim();
+            if !verification.eq_ignore_ascii_case("none") && !verification.is_empty() {
+                parsed.verification = Some(verification.to_string());
+            }
+        }
+    }
+    parsed
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+}
+
+fn post_quick_fix_pr_update_comment(
+    repo: &str,
+    pr: u64,
+    summaries: &[QuickFixSummary],
+) -> anyhow::Result<Option<String>> {
+    if summaries.is_empty() {
+        return Ok(None);
+    }
+
+    let body = format_pr_update_comment_body(summaries);
+    let body_file = write_temp_markdown_file("codex-pr-update", &body)?;
+    let args = vec![
+        "pr".to_string(),
+        "comment".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        pr.to_string(),
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let result = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let text = result?;
+    Ok(extract_first_url(&text))
+}
+
+fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
+    let mut body = String::from("Quick-fix update from `codex process pr-comments --act`.\n\n");
+    body.push_str("Applied items:\n");
+    for item in summaries {
+        let mut line = format!("- `{}`: {}", item.comment_id, item.summary);
+        if !item.files.is_empty() {
+            let files = item.files.join(", ");
+            line.push_str(&format!(" (files: {files})"));
+        }
+        if let Some(verification) = &item.verification {
+            line.push_str(&format!("; verification: {verification}"));
+        }
+        if let (Some(commit_sha), Some(commit_url)) = (&item.commit_sha, &item.commit_url) {
+            line.push_str(&format!(
+                "; commit: [`{}`]({commit_url})",
+                short_commit_sha(commit_sha)
+            ));
+        }
+        body.push_str(&line);
+        body.push('\n');
+    }
+    body
+}
+
+fn short_commit_sha(sha: &str) -> &str {
+    if sha.len() > 12 {
+        return &sha[..12];
+    }
+    sha
+}
+
+fn extract_first_url(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        if token.starts_with("https://") || token.starts_with("http://") {
+            return Some(
+                token
+                    .trim_end_matches(|ch: char| ",.)]".contains(ch))
+                    .to_string(),
+            );
+        }
+        None
+    })
+}
+
+fn write_temp_markdown_file(prefix: &str, body: &str) -> anyhow::Result<std::path::PathBuf> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("{prefix}-{millis}-{pid}.md"));
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+fn to_markdown_blockquote(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            lines.push(">".to_string());
+        } else {
+            lines.push(format!("> {}", line.trim_end()));
+        }
+    }
+    if lines.is_empty() {
+        return "> (empty comment)".to_string();
+    }
+    lines.join("\n")
+}
+
+fn format_follow_up_issue_body(
+    repo: &str,
+    pr: u64,
+    comment_url: &str,
+    comment_body: &str,
+) -> String {
+    format!(
+        "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/{repo}/pull/{pr}\n- Source comment: {comment_url}\n\nOriginal comment:\n\n{quoted}\n",
+        quoted = to_markdown_blockquote(comment_body),
+    )
+}
+
+fn create_follow_up_issue(
+    repo: &str,
+    pr: u64,
+    author: &str,
+    comment_url: &str,
+    comment_body: &str,
+) -> anyhow::Result<String> {
+    let mut title = format!("Follow-up from PR #{pr} comment by {author}");
+    let first_line = comment_body.lines().next().unwrap_or_default().trim();
+    if !first_line.is_empty() {
+        let truncated = first_line.chars().take(80).collect::<String>();
+        title = format!("{title}: {truncated}");
+    }
+
+    let body = format_follow_up_issue_body(repo, pr, comment_url, comment_body);
+    let body_file = write_temp_markdown_file("codex-follow-up-issue", &body)?;
+    let args = vec![
+        "issue".to_string(),
+        "create".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--title".to_string(),
+        title,
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let issue_url = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let issue_url = issue_url?;
+    if let Some(url) = extract_first_url(&issue_url) {
+        return Ok(url);
+    }
+    anyhow::bail!("`gh issue create` succeeded but did not return an issue URL: {issue_url}");
+}
+
+fn suggested_next_actions(grouped_by_type: &GroupedByType) -> Vec<String> {
+    let mut actions = Vec::new();
+    if grouped_by_type.unresolved_review_comments > 0 {
+        actions.push("Address unresolved review comments first.".to_string());
+    }
+    if grouped_by_type.open_issue_comments > 0 {
+        actions.push("Reply to open issue comments on the PR conversation.".to_string());
+    }
+    if grouped_by_type.total == 0 {
+        actions.push(
+            "No open comments found; proceed with final verification and merge checks.".to_string(),
+        );
+    } else {
+        actions.push("After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string());
+    }
+    actions
+}
+
+fn suggest_issue_watch_actions(open_issues: &[ProcessWatchIssue]) -> Vec<String> {
+    if open_issues.is_empty() {
+        return vec!["No matching open issues found.".to_string()];
+    }
+
+    open_issues
+        .iter()
+        .take(5)
+        .map(|issue| {
+            format!(
+                "Plan automation for issue #{number} ({url})",
+                number = issue.number,
+                url = issue.url.as_str()
+            )
+        })
+        .collect()
 }
 
 async fn enable_feature_in_config(interactive: &TuiCli, feature: &str) -> anyhow::Result<()> {
@@ -1498,6 +3086,355 @@ mod tests {
             panic!("expected features disable");
         };
         assert_eq!(feature, "shell_tool");
+    }
+
+    #[test]
+    fn process_run_parses_task() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "run",
+            "--task",
+            "Implement process mode",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Run(ProcessRunArgs { task }) = sub else {
+            panic!("expected process run");
+        };
+        assert_eq!(task, "Implement process mode");
+    }
+
+    #[test]
+    fn process_pr_comments_parses_target() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr, act }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert_eq!(repo, "njfio/codex-process");
+        assert_eq!(pr, 1);
+        assert!(!act);
+    }
+
+    #[test]
+    fn process_pr_comments_parses_act_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+            "--act",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { act, .. }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert!(act);
+    }
+
+    #[test]
+    fn process_issues_watch_parses_args() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--limit",
+            "20",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { repo, label, limit }) = sub;
+        assert_eq!(repo, "njfio/codex-process");
+        assert_eq!(label, "process:auto-fix");
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_accepts_valid_repo() {
+        let parsed = parse_repo_owner_and_name("openai/codex").expect("repo parses");
+        assert_eq!(parsed, ("openai".to_string(), "codex".to_string()));
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_rejects_invalid_repo() {
+        let err = parse_repo_owner_and_name("openai").expect_err("repo should fail");
+        assert_eq!(
+            err.to_string(),
+            "Invalid --repo value `openai`. Expected `owner/name`."
+        );
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_rejects_too_many_path_segments() {
+        let err = parse_repo_owner_and_name("openai/codex/extra").expect_err("repo should fail");
+        assert_eq!(
+            err.to_string(),
+            "Invalid --repo value `openai/codex/extra`. Expected `owner/name`."
+        );
+    }
+
+    #[test]
+    fn parse_unresolved_review_comment_page_filters_out_resolved_threads() {
+        let input = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "PRRC_1",
+                                                "author": { "login": "alice" },
+                                                "path": "src/lib.rs",
+                                                "line": 42,
+                                                "body": "Please simplify this branch.",
+                                                "url": "https://github.com/openai/codex/pull/1#discussion_r1"
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "isResolved": true,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "PRRC_2",
+                                                "author": { "login": "bob" },
+                                                "path": "src/main.rs",
+                                                "line": 7,
+                                                "body": "Already fixed.",
+                                                "url": "https://github.com/openai/codex/pull/1#discussion_r2"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "endCursor": null
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_unresolved_review_comment_page(input).expect("parses");
+        assert_eq!(
+            parsed.comments,
+            vec![UnresolvedReviewComment {
+                id: "PRRC_1".to_string(),
+                author: "alice".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: Some(42),
+                body: "Please simplify this branch.".to_string(),
+                url: "https://github.com/openai/codex/pull/1#discussion_r1".to_string(),
+            }]
+        );
+        assert!(!parsed.has_next_page);
+        assert_eq!(parsed.end_cursor, None);
+    }
+
+    #[test]
+    fn parse_issue_comments_supports_paginated_response() {
+        let input = serde_json::json!([
+            [
+                {
+                    "id": 101,
+                    "body": "Can you add a test?",
+                    "html_url": "https://github.com/openai/codex/issues/1#issuecomment-101",
+                    "user": { "login": "carol" }
+                }
+            ],
+            [
+                {
+                    "id": 202,
+                    "body": "Looks good after updates.",
+                    "html_url": "https://github.com/openai/codex/issues/1#issuecomment-202",
+                    "user": { "login": "dave" }
+                }
+            ]
+        ]);
+
+        let parsed = parse_issue_comments(input).expect("parses");
+        assert_eq!(
+            parsed,
+            vec![
+                OpenIssueComment {
+                    id: "101".to_string(),
+                    author: "carol".to_string(),
+                    body: "Can you add a test?".to_string(),
+                    url: "https://github.com/openai/codex/issues/1#issuecomment-101".to_string(),
+                },
+                OpenIssueComment {
+                    id: "202".to_string(),
+                    author: "dave".to_string(),
+                    body: "Looks good after updates.".to_string(),
+                    url: "https://github.com/openai/codex/issues/1#issuecomment-202".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn suggested_next_actions_handles_empty_and_non_empty_states() {
+        let empty = GroupedByType {
+            unresolved_review_comments: 0,
+            open_issue_comments: 0,
+            total: 0,
+        };
+        assert_eq!(
+            suggested_next_actions(&empty),
+            vec![
+                "No open comments found; proceed with final verification and merge checks."
+                    .to_string()
+            ]
+        );
+
+        let non_empty = GroupedByType {
+            unresolved_review_comments: 1,
+            open_issue_comments: 2,
+            total: 3,
+        };
+        assert_eq!(
+            suggested_next_actions(&non_empty),
+            vec![
+                "Address unresolved review comments first.".to_string(),
+                "Reply to open issue comments on the PR conversation.".to_string(),
+                "After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_comment_triage_prioritizes_needs_issue_keywords() {
+        let decision =
+            classify_comment_triage("This is out of scope for this PR, please open a follow-up.");
+        assert_eq!(decision, TriageDecision::NeedsIssue);
+    }
+
+    #[test]
+    fn classify_comment_triage_detects_question() {
+        let decision = classify_comment_triage("Can we simplify this flow?");
+        assert_eq!(decision, TriageDecision::Question);
+    }
+
+    #[test]
+    fn classify_comment_triage_defaults_to_quick_fix() {
+        let decision = classify_comment_triage("Please update this implementation detail.");
+        assert_eq!(decision, TriageDecision::QuickFix);
+    }
+
+    #[test]
+    fn parse_quick_fix_output_extracts_summary_files_and_verification() {
+        let output = "SUMMARY: Rename local variable for clarity\nFILES: cli/src/main.rs, README.md\nVERIFICATION: not run";
+        let parsed = parse_quick_fix_output(output);
+        assert_eq!(
+            parsed,
+            ParsedQuickFixOutput {
+                summary: Some("Rename local variable for clarity".to_string()),
+                files: vec!["cli/src/main.rs".to_string(), "README.md".to_string()],
+                verification: Some("not run".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn format_follow_up_issue_body_renders_readable_markdown() {
+        let body = format_follow_up_issue_body(
+            "openai/codex",
+            42,
+            "https://github.com/openai/codex/pull/42#discussion_r1",
+            "Please fix this.\n\nNeed tests.",
+        );
+        assert_eq!(
+            body,
+            "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/openai/codex/pull/42\n- Source comment: https://github.com/openai/codex/pull/42#discussion_r1\n\nOriginal comment:\n\n> Please fix this.\n>\n> Need tests.\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn extract_first_url_returns_http_url_with_trailing_punctuation_trimmed() {
+        let text = "comment posted: https://github.com/openai/codex/pull/1#issuecomment-2). done";
+        let parsed = extract_first_url(text);
+        assert_eq!(
+            parsed,
+            Some("https://github.com/openai/codex/pull/1#issuecomment-2".to_string())
+        );
+    }
+
+    #[test]
+    fn format_pr_update_comment_body_includes_files_and_verification_when_available() {
+        let body = format_pr_update_comment_body(&[QuickFixSummary {
+            comment_id: "PRRC_123".to_string(),
+            summary: "Applied minimal fix".to_string(),
+            files: vec!["codex-rs/cli/src/main.rs".to_string()],
+            verification: Some("not run".to_string()),
+            commit_sha: Some("0123456789abcdef".to_string()),
+            commit_url: Some(
+                "https://github.com/openai/codex-process/commit/0123456789abcdef".to_string(),
+            ),
+        }]);
+        assert_eq!(
+            body,
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef)\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn quick_fix_branch_name_is_deterministic_and_safe() {
+        let branch = quick_fix_branch_name(123, "PRRC_ABC/123");
+        assert_eq!(branch, "process/quick-fix-pr-123-prrc-abc-123".to_string());
+    }
+
+    #[test]
+    fn quick_fix_commit_url_uses_repo_and_sha() {
+        let url = quick_fix_commit_url("openai/codex-process", "abc123");
+        assert_eq!(
+            url,
+            "https://github.com/openai/codex-process/commit/abc123".to_string()
+        );
+    }
+
+    #[test]
+    fn short_commit_sha_truncates_long_values() {
+        assert_eq!(short_commit_sha("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_commit_sha("abc123"), "abc123");
     }
 
     #[test]

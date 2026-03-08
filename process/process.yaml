@@ -1,0 +1,23 @@
+version: 0
+mode: opt-in
+states:
+  - INTAKE
+  - CONTRACT
+  - RED
+  - GREEN
+  - VERIFY
+  - EVIDENCE
+  - READY
+required_artifacts:
+  CONTRACT: [contract.json]
+  RED: [red-proof.json]
+  VERIFY: [verify.json]
+  EVIDENCE: [traceability.json, summary.md]
+roles:
+  - architect
+  - builder
+  - pr_responder
+artifact_root: .process/runs
+github:
+  pr_comment_mode: unresolved_only
+  response_style: evidence_backed
