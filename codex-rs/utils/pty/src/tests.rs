@@ -57,7 +57,7 @@ fn echo_sleep_command(marker: &str) -> String {
 
 fn split_stdout_stderr_command() -> String {
     if cfg!(windows) {
-        "echo split-out & echo split-err 1>&2".to_string()
+        "(echo split-out)&(echo split-err 1>&2)".to_string()
     } else {
         "printf 'split-out\\n'; printf 'split-err\\n' >&2".to_string()
     }
