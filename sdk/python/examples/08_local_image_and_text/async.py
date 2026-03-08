@@ -1,18 +1,11 @@
 import asyncio
-from base64 import b64decode
 from pathlib import Path
 
 from codex_app_server import AsyncCodex, LocalImageInput, TextInput
 
-HERE = Path(__file__).parent
-IMAGE_PATH = HERE / "sample.png"
-
+IMAGE_PATH = Path(__file__).resolve().parents[1] / "assets" / "sample_scene.png"
 if not IMAGE_PATH.exists():
-    IMAGE_PATH.write_bytes(
-        b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4xQAAAAASUVORK5CYII="
-        )
-    )
+    raise FileNotFoundError(f"Missing bundled image: {IMAGE_PATH}")
 
 
 async def main() -> None:

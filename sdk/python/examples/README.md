@@ -40,7 +40,7 @@ python examples/01_quickstart_constructor/async.py
 - `07_image_and_text/`
   - remote image URL + text multimodal turn
 - `08_local_image_and_text/`
-  - local image + text multimodal turn (auto-downloads sample image)
+  - local image + text multimodal turn using bundled sample image
 - `09_async_parity/`
   - parity-style sync flow (see async parity in other examples)
 - `10_error_handling_and_retry/`
