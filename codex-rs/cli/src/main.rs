@@ -1092,6 +1092,10 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             decision: classify_comment_triage(&comment.body),
             created_issue_url: None,
             todo: None,
+            quick_fix_attempted: false,
+            quick_fix_success: None,
+            quick_fix_summary: None,
+            quick_fix_error: None,
         })
         .collect::<Vec<_>>();
     triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
@@ -1104,20 +1108,51 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             decision: classify_comment_triage(&comment.body),
             created_issue_url: None,
             todo: None,
+            quick_fix_attempted: false,
+            quick_fix_success: None,
+            quick_fix_summary: None,
+            quick_fix_error: None,
         }
     }));
 
     let mut grouped_by_decision = ProcessTriageCounts::default();
     let mut created_issues = Vec::new();
+    let mut successful_quick_fixes = Vec::new();
     for item in &mut triage_items {
         match item.decision {
             TriageDecision::QuickFix => {
                 grouped_by_decision.quick_fix += 1;
-                item.todo = Some(format!(
-                    "TODO: apply quick fix for comment {comment_id} ({comment_url})",
-                    comment_id = item.comment_id.as_str(),
-                    comment_url = item.comment_url.as_str()
-                ));
+                let execution = run_quick_fix_subprocess(&args.repo, args.pr, item);
+                let execution_summary = if execution.success {
+                    Some(
+                        execution
+                            .summary
+                            .clone()
+                            .unwrap_or_else(|| "Applied targeted quick fix.".to_string()),
+                    )
+                } else {
+                    execution.summary.clone()
+                };
+                item.quick_fix_attempted = execution.attempted;
+                item.quick_fix_success = Some(execution.success);
+                item.quick_fix_summary = execution_summary.clone();
+                item.quick_fix_error = execution.error.clone();
+                if execution.success {
+                    let summary = execution_summary
+                        .unwrap_or_else(|| "Applied targeted quick fix.".to_string());
+                    successful_quick_fixes.push(QuickFixSummary {
+                        comment_id: item.comment_id.clone(),
+                        summary,
+                        files: execution.files,
+                        verification: execution.verification,
+                    });
+                } else {
+                    item.todo = Some(format!(
+                        "TODO: manual quick fix for comment {comment_id} ({comment_url})",
+                        comment_id = item.comment_id.as_str(),
+                        comment_url = item.comment_url.as_str()
+                    ));
+                }
             }
             TriageDecision::NeedsIssue => {
                 grouped_by_decision.needs_issue += 1;
@@ -1140,6 +1175,11 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             }
         }
     }
+    let pr_update_comment_url = if successful_quick_fixes.is_empty() {
+        None
+    } else {
+        post_quick_fix_pr_update_comment(&args.repo, args.pr, &successful_quick_fixes)?
+    };
 
     let triage_artifact = ProcessPrCommentsTriageArtifact {
         repo: args.repo.clone(),
@@ -1148,6 +1188,7 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         triage_items,
         grouped_by_decision,
         created_issues: created_issues.clone(),
+        pr_update_comment_url: pr_update_comment_url.clone(),
     };
     std::fs::write(
         run_dir.join("triage.json"),
@@ -1171,6 +1212,11 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         for issue in created_issues {
             println!("- {}", issue.issue_url);
         }
+    }
+    if let Some(url) = pr_update_comment_url {
+        println!("PR update comment URL: {url}");
+    } else {
+        println!("PR update comment URL: none");
     }
     Ok(())
 }
@@ -1232,6 +1278,10 @@ struct ProcessCommentTriageItem {
     decision: TriageDecision,
     created_issue_url: Option<String>,
     todo: Option<String>,
+    quick_fix_attempted: bool,
+    quick_fix_success: Option<bool>,
+    quick_fix_summary: Option<String>,
+    quick_fix_error: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
@@ -1259,6 +1309,32 @@ struct ProcessPrCommentsTriageArtifact {
     triage_items: Vec<ProcessCommentTriageItem>,
     grouped_by_decision: ProcessTriageCounts,
     created_issues: Vec<ProcessCreatedIssue>,
+    pr_update_comment_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixExecutionResult {
+    attempted: bool,
+    success: bool,
+    summary: Option<String>,
+    error: Option<String>,
+    files: Vec<String>,
+    verification: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixSummary {
+    comment_id: String,
+    summary: String,
+    files: Vec<String>,
+    verification: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedQuickFixOutput {
+    summary: Option<String>,
+    files: Vec<String>,
+    verification: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
@@ -1730,6 +1806,231 @@ fn classify_comment_triage(body: &str) -> TriageDecision {
     TriageDecision::QuickFix
 }
 
+fn run_quick_fix_subprocess(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+) -> QuickFixExecutionResult {
+    let prompt = build_quick_fix_prompt(repo, pr, item);
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            return QuickFixExecutionResult {
+                attempted: false,
+                success: false,
+                summary: None,
+                error: Some(format!(
+                    "Unable to locate current executable for quick-fix run: {err}"
+                )),
+                files: Vec::new(),
+                verification: None,
+            };
+        }
+    };
+    let output = match std::process::Command::new(executable)
+        .args(["exec", "--skip-git-repo-check", "--full-auto", &prompt])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let error = if err.kind() == ErrorKind::NotFound {
+                "Unable to execute current binary for quick-fix run.".to_string()
+            } else {
+                format!("Failed to launch quick-fix subprocess: {err}")
+            };
+            return QuickFixExecutionResult {
+                attempted: true,
+                success: false,
+                summary: None,
+                error: Some(error),
+                files: Vec::new(),
+                verification: None,
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed = parse_quick_fix_output(&stdout);
+    let summary = parsed
+        .summary
+        .or_else(|| first_non_empty_line(&stdout))
+        .or_else(|| first_non_empty_line(&stderr));
+
+    if output.status.success() {
+        return QuickFixExecutionResult {
+            attempted: true,
+            success: true,
+            summary,
+            error: None,
+            files: parsed.files,
+            verification: parsed.verification,
+        };
+    }
+
+    let status = output.status.code().map_or_else(
+        || "terminated by signal".to_string(),
+        |code| code.to_string(),
+    );
+    let detail = first_non_empty_line(&stderr)
+        .or_else(|| first_non_empty_line(&stdout))
+        .unwrap_or_else(|| "subprocess returned no output".to_string());
+    QuickFixExecutionResult {
+        attempted: true,
+        success: false,
+        summary,
+        error: Some(format!(
+            "Quick-fix subprocess failed (status {status}): {detail}"
+        )),
+        files: parsed.files,
+        verification: parsed.verification,
+    }
+}
+
+fn build_quick_fix_prompt(repo: &str, pr: u64, item: &ProcessCommentTriageItem) -> String {
+    let trimmed_body = item.body.trim();
+    let bounded_body = trimmed_body.chars().take(2_000).collect::<String>();
+    format!(
+        "You are applying a minimal targeted fix in this repository.\n\nRepository: {repo}\nPR number: {pr}\nComment URL: {comment_url}\nComment body:\n{comment_body}\n\nRequirements:\n- Apply the smallest safe change that addresses the comment.\n- Keep scope tight to this comment only.\n- If verification is quick, run only focused checks.\n- Return exactly these lines at the end:\nSUMMARY: <one-line summary>\nFILES: <comma-separated file paths or none>\nVERIFICATION: <short status or none>",
+        comment_url = item.comment_url,
+        comment_body = bounded_body,
+    )
+}
+
+fn parse_quick_fix_output(output: &str) -> ParsedQuickFixOutput {
+    let mut parsed = ParsedQuickFixOutput::default();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(summary) = trimmed.strip_prefix("SUMMARY:") {
+            let summary = summary.trim();
+            if !summary.is_empty() {
+                parsed.summary = Some(summary.to_string());
+            }
+            continue;
+        }
+        if let Some(files) = trimmed.strip_prefix("FILES:") {
+            let files = files.trim();
+            if !files.eq_ignore_ascii_case("none") && !files.is_empty() {
+                parsed.files = files
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+            continue;
+        }
+        if let Some(verification) = trimmed.strip_prefix("VERIFICATION:") {
+            let verification = verification.trim();
+            if !verification.eq_ignore_ascii_case("none") && !verification.is_empty() {
+                parsed.verification = Some(verification.to_string());
+            }
+        }
+    }
+    parsed
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+}
+
+fn post_quick_fix_pr_update_comment(
+    repo: &str,
+    pr: u64,
+    summaries: &[QuickFixSummary],
+) -> anyhow::Result<Option<String>> {
+    if summaries.is_empty() {
+        return Ok(None);
+    }
+
+    let body = format_pr_update_comment_body(summaries);
+    let body_file = write_temp_markdown_file("codex-pr-update", &body)?;
+    let args = vec![
+        "pr".to_string(),
+        "comment".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        pr.to_string(),
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let result = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let text = result?;
+    Ok(extract_first_url(&text))
+}
+
+fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
+    let mut body = String::from("Quick-fix update from `codex process pr-comments --act`.\n\n");
+    body.push_str("Applied items:\n");
+    for item in summaries {
+        let mut line = format!("- `{}`: {}", item.comment_id, item.summary);
+        if !item.files.is_empty() {
+            let files = item.files.join(", ");
+            line.push_str(&format!(" (files: {files})"));
+        }
+        if let Some(verification) = &item.verification {
+            line.push_str(&format!("; verification: {verification}"));
+        }
+        body.push_str(&line);
+        body.push('\n');
+    }
+    body
+}
+
+fn extract_first_url(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        if token.starts_with("https://") || token.starts_with("http://") {
+            return Some(
+                token
+                    .trim_end_matches(|ch: char| ",.)]".contains(ch))
+                    .to_string(),
+            );
+        }
+        None
+    })
+}
+
+fn write_temp_markdown_file(prefix: &str, body: &str) -> anyhow::Result<std::path::PathBuf> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("{prefix}-{millis}-{pid}.md"));
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+fn to_markdown_blockquote(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            lines.push(">".to_string());
+        } else {
+            lines.push(format!("> {}", line.trim_end()));
+        }
+    }
+    if lines.is_empty() {
+        return "> (empty comment)".to_string();
+    }
+    lines.join("\n")
+}
+
+fn format_follow_up_issue_body(
+    repo: &str,
+    pr: u64,
+    comment_url: &str,
+    comment_body: &str,
+) -> String {
+    format!(
+        "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/{repo}/pull/{pr}\n- Source comment: {comment_url}\n\nOriginal comment:\n\n{quoted}\n",
+        quoted = to_markdown_blockquote(comment_body),
+    )
+}
+
 fn create_follow_up_issue(
     repo: &str,
     pr: u64,
@@ -1744,9 +2045,8 @@ fn create_follow_up_issue(
         title = format!("{title}: {truncated}");
     }
 
-    let body = format!(
-        "Created by `codex process pr-comments --act`.\n\nSource PR: https://github.com/{repo}/pull/{pr}\nSource comment: {comment_url}\n\nOriginal comment:\n\n{comment_body}\n"
-    );
+    let body = format_follow_up_issue_body(repo, pr, comment_url, comment_body);
+    let body_file = write_temp_markdown_file("codex-follow-up-issue", &body)?;
     let args = vec![
         "issue".to_string(),
         "create".to_string(),
@@ -1754,12 +2054,14 @@ fn create_follow_up_issue(
         repo.to_string(),
         "--title".to_string(),
         title,
-        "--body".to_string(),
-        body,
+        "--body-file".to_string(),
+        body_file.display().to_string(),
     ];
-    let issue_url = run_gh_text_command(&args)?;
-    if issue_url.starts_with("http://") || issue_url.starts_with("https://") {
-        return Ok(issue_url);
+    let issue_url = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let issue_url = issue_url?;
+    if let Some(url) = extract_first_url(&issue_url) {
+        return Ok(url);
     }
     anyhow::bail!("`gh issue create` succeeded but did not return an issue URL: {issue_url}");
 }
@@ -2732,6 +3034,60 @@ mod tests {
     fn classify_comment_triage_defaults_to_quick_fix() {
         let decision = classify_comment_triage("Please update this implementation detail.");
         assert_eq!(decision, TriageDecision::QuickFix);
+    }
+
+    #[test]
+    fn parse_quick_fix_output_extracts_summary_files_and_verification() {
+        let output = "SUMMARY: Rename local variable for clarity\nFILES: cli/src/main.rs, README.md\nVERIFICATION: not run";
+        let parsed = parse_quick_fix_output(output);
+        assert_eq!(
+            parsed,
+            ParsedQuickFixOutput {
+                summary: Some("Rename local variable for clarity".to_string()),
+                files: vec!["cli/src/main.rs".to_string(), "README.md".to_string()],
+                verification: Some("not run".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn format_follow_up_issue_body_renders_readable_markdown() {
+        let body = format_follow_up_issue_body(
+            "openai/codex",
+            42,
+            "https://github.com/openai/codex/pull/42#discussion_r1",
+            "Please fix this.\n\nNeed tests.",
+        );
+        assert_eq!(
+            body,
+            "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/openai/codex/pull/42\n- Source comment: https://github.com/openai/codex/pull/42#discussion_r1\n\nOriginal comment:\n\n> Please fix this.\n>\n> Need tests.\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn extract_first_url_returns_http_url_with_trailing_punctuation_trimmed() {
+        let text = "comment posted: https://github.com/openai/codex/pull/1#issuecomment-2). done";
+        let parsed = extract_first_url(text);
+        assert_eq!(
+            parsed,
+            Some("https://github.com/openai/codex/pull/1#issuecomment-2".to_string())
+        );
+    }
+
+    #[test]
+    fn format_pr_update_comment_body_includes_files_and_verification_when_available() {
+        let body = format_pr_update_comment_body(&[QuickFixSummary {
+            comment_id: "PRRC_123".to_string(),
+            summary: "Applied minimal fix".to_string(),
+            files: vec!["codex-rs/cli/src/main.rs".to_string()],
+            verification: Some("not run".to_string()),
+        }]);
+        assert_eq!(
+            body,
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run\n"
+                .to_string()
+        );
     }
 
     #[test]
