@@ -1,9 +1,9 @@
+use anyhow::Context;
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
-use anyhow::Context;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
@@ -559,6 +559,8 @@ enum ProcessSubcommand {
     /// Ingest open PR comments from GitHub and scaffold response planning artifacts.
     #[clap(name = "pr-comments")]
     PrComments(ProcessPrCommentsArgs),
+    /// Watch open issues for process automation.
+    Issues(ProcessIssuesCli),
 }
 
 #[derive(Debug, Args)]
@@ -584,6 +586,37 @@ struct ProcessPrCommentsArgs {
     /// Pull request number.
     #[arg(long)]
     pr: u64,
+
+    /// Triage comments and create follow-up issues for deferred work.
+    #[arg(long, default_value_t = false)]
+    act: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProcessIssuesCli {
+    #[command(subcommand)]
+    sub: ProcessIssuesSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ProcessIssuesSubcommand {
+    /// Fetch matching open issues and produce an automation action plan artifact.
+    Watch(ProcessIssuesWatchArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProcessIssuesWatchArgs {
+    /// Repository in owner/name format.
+    #[arg(long)]
+    repo: String,
+
+    /// Label to filter issues.
+    #[arg(long)]
+    label: String,
+
+    /// Max number of issues to fetch.
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
 }
 
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
@@ -838,6 +871,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             ProcessSubcommand::PrComments(args) => {
                 process_mode_pr_comments(args)?;
             }
+            ProcessSubcommand::Issues(ProcessIssuesCli { sub }) => match sub {
+                ProcessIssuesSubcommand::Watch(args) => {
+                    process_mode_issues_watch(args)?;
+                }
+            },
         },
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
@@ -908,7 +946,10 @@ fn run_process_mode(args: ProcessRunArgs) -> anyhow::Result<()> {
         "task": args.task,
         "status": "pending"
     });
-    std::fs::write(run_dir.join("contract.json"), serde_json::to_string_pretty(&contract)?)?;
+    std::fs::write(
+        run_dir.join("contract.json"),
+        serde_json::to_string_pretty(&contract)?,
+    )?;
 
     let red_proof = serde_json::json!({
         "state": "RED",
@@ -925,7 +966,10 @@ fn run_process_mode(args: ProcessRunArgs) -> anyhow::Result<()> {
         "status": "pending",
         "required": ["lint", "tests"]
     });
-    std::fs::write(run_dir.join("verify.json"), serde_json::to_string_pretty(&verify)?)?;
+    std::fs::write(
+        run_dir.join("verify.json"),
+        serde_json::to_string_pretty(&verify)?,
+    )?;
 
     let traceability = serde_json::json!({
         "state": "EVIDENCE",
@@ -995,14 +1039,24 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&run_dir)?;
 
     let unresolved_review_comments = fetch_unresolved_review_comments(&owner, &name, args.pr)
-        .with_context(|| format!("Failed to fetch unresolved review comments for {}#{}", args.repo, args.pr))?;
-    let open_issue_comments = fetch_issue_comments(&args.repo, args.pr)
-        .with_context(|| format!("Failed to fetch issue comments for {}#{}", args.repo, args.pr))?;
+        .with_context(|| {
+            format!(
+                "Failed to fetch unresolved review comments for {}#{}",
+                args.repo, args.pr
+            )
+        })?;
+    let open_issue_comments = fetch_issue_comments(&args.repo, args.pr).with_context(|| {
+        format!(
+            "Failed to fetch issue comments for {}#{}",
+            args.repo, args.pr
+        )
+    })?;
     let grouped_by_type = GroupedByType {
         unresolved_review_comments: unresolved_review_comments.len(),
         open_issue_comments: open_issue_comments.len(),
         total: unresolved_review_comments.len() + open_issue_comments.len(),
     };
+    let suggested_next_actions = suggested_next_actions(&grouped_by_type);
     let payload = ProcessPrCommentsArtifact {
         repo: args.repo.clone(),
         pr: args.pr,
@@ -1012,16 +1066,112 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         unresolved_review_comments,
         open_issue_comments,
         grouped_by_type,
-        suggested_next_actions: suggested_next_actions(&grouped_by_type),
+        suggested_next_actions,
     };
     std::fs::write(
         run_dir.join("pr-comments.json"),
         serde_json::to_string_pretty(&payload)?,
     )?;
 
-    println!("PR comment response run created: {run_id}");
+    if !args.act {
+        println!("PR comment response run created: {run_id}");
+        println!("Target: {}#{}", args.repo, args.pr);
+        println!("Artifact: {}", run_dir.join("pr-comments.json").display());
+        return Ok(());
+    }
+
+    let mut triage_items = payload
+        .unresolved_review_comments
+        .iter()
+        .map(|comment| ProcessCommentTriageItem {
+            source: "review_comment".to_string(),
+            comment_id: comment.id.clone(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            comment_url: comment.url.clone(),
+            decision: classify_comment_triage(&comment.body),
+            created_issue_url: None,
+            todo: None,
+        })
+        .collect::<Vec<_>>();
+    triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
+        ProcessCommentTriageItem {
+            source: "issue_comment".to_string(),
+            comment_id: comment.id.clone(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            comment_url: comment.url.clone(),
+            decision: classify_comment_triage(&comment.body),
+            created_issue_url: None,
+            todo: None,
+        }
+    }));
+
+    let mut grouped_by_decision = ProcessTriageCounts::default();
+    let mut created_issues = Vec::new();
+    for item in &mut triage_items {
+        match item.decision {
+            TriageDecision::QuickFix => {
+                grouped_by_decision.quick_fix += 1;
+                item.todo = Some(format!(
+                    "TODO: apply quick fix for comment {comment_id} ({comment_url})",
+                    comment_id = item.comment_id.as_str(),
+                    comment_url = item.comment_url.as_str()
+                ));
+            }
+            TriageDecision::NeedsIssue => {
+                grouped_by_decision.needs_issue += 1;
+                let issue_url = create_follow_up_issue(
+                    &args.repo,
+                    args.pr,
+                    &item.author,
+                    &item.comment_url,
+                    &item.body,
+                )?;
+                item.created_issue_url = Some(issue_url.clone());
+                created_issues.push(ProcessCreatedIssue {
+                    source_comment_id: item.comment_id.clone(),
+                    source_comment_url: item.comment_url.clone(),
+                    issue_url,
+                });
+            }
+            TriageDecision::Question => {
+                grouped_by_decision.question += 1;
+            }
+        }
+    }
+
+    let triage_artifact = ProcessPrCommentsTriageArtifact {
+        repo: args.repo.clone(),
+        pr: args.pr,
+        fetched_at: payload.fetched_at,
+        triage_items,
+        grouped_by_decision,
+        created_issues: created_issues.clone(),
+    };
+    std::fs::write(
+        run_dir.join("triage.json"),
+        serde_json::to_string_pretty(&triage_artifact)?,
+    )?;
+
+    println!("PR comment action run created: {run_id}");
     println!("Target: {}#{}", args.repo, args.pr);
-    println!("Artifact: {}", run_dir.join("pr-comments.json").display());
+    println!("Ingested comments: {}", payload.grouped_by_type.total);
+    println!(
+        "Triage counts: quick_fix={}, needs_issue={}, question={}",
+        triage_artifact.grouped_by_decision.quick_fix,
+        triage_artifact.grouped_by_decision.needs_issue,
+        triage_artifact.grouped_by_decision.question
+    );
+    println!("Artifact: {}", run_dir.join("triage.json").display());
+    if created_issues.is_empty() {
+        println!("Created issue URLs: none");
+    } else {
+        println!("Created issue URLs:");
+        for issue in created_issues {
+            println!("- {}", issue.issue_url);
+        }
+    }
     Ok(())
 }
 
@@ -1061,6 +1211,72 @@ struct GroupedByType {
     unresolved_review_comments: usize,
     open_issue_comments: usize,
     total: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TriageDecision {
+    QuickFix,
+    NeedsIssue,
+    Question,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessCommentTriageItem {
+    source: String,
+    comment_id: String,
+    author: String,
+    body: String,
+    comment_url: String,
+    decision: TriageDecision,
+    created_issue_url: Option<String>,
+    todo: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTriageCounts {
+    quick_fix: usize,
+    needs_issue: usize,
+    question: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessCreatedIssue {
+    source_comment_id: String,
+    source_comment_url: String,
+    issue_url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessPrCommentsTriageArtifact {
+    repo: String,
+    pr: u64,
+    fetched_at: u64,
+    triage_items: Vec<ProcessCommentTriageItem>,
+    grouped_by_decision: ProcessTriageCounts,
+    created_issues: Vec<ProcessCreatedIssue>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessIssuesWatchArtifact {
+    fetched_at: u64,
+    repo: String,
+    label: String,
+    open_issues: Vec<ProcessWatchIssue>,
+    suggested_actions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessWatchIssue {
+    number: u64,
+    title: String,
+    url: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1153,6 +1369,14 @@ struct GhIssueCommentUser {
     login: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhIssueListItem {
+    number: u64,
+    title: String,
+    url: String,
+}
+
 fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
     let Some((owner, name)) = repo.split_once('/') else {
         anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
@@ -1161,6 +1385,43 @@ fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
         anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
     }
     Ok((owner.to_string(), name.to_string()))
+}
+
+fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()> {
+    parse_repo_owner_and_name(&args.repo)?;
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let issues =
+        fetch_open_issues_by_label(&args.repo, &args.label, args.limit).with_context(|| {
+            format!(
+                "Failed to fetch open issues for {} with label {}",
+                args.repo, args.label
+            )
+        })?;
+    let artifact = ProcessIssuesWatchArtifact {
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        repo: args.repo.clone(),
+        label: args.label.clone(),
+        suggested_actions: suggest_issue_watch_actions(&issues),
+        open_issues: issues,
+    };
+    std::fs::write(
+        run_dir.join("issues-watch.json"),
+        serde_json::to_string_pretty(&artifact)?,
+    )?;
+
+    println!("Issues watch run created: {run_id}");
+    println!("Target: {} [{}]", args.repo, args.label);
+    println!("Open issues fetched: {}", artifact.open_issues.len());
+    println!("Artifact: {}", run_dir.join("issues-watch.json").display());
+    Ok(())
 }
 
 fn fetch_unresolved_review_comments(
@@ -1223,7 +1484,9 @@ fn fetch_unresolved_review_comments(
             break;
         }
         let Some(next_cursor) = parsed_page.end_cursor else {
-            anyhow::bail!("GitHub API returned pagination without a cursor for unresolved review comments.");
+            anyhow::bail!(
+                "GitHub API returned pagination without a cursor for unresolved review comments."
+            );
         };
         cursor = Some(next_cursor);
     }
@@ -1240,6 +1503,38 @@ fn fetch_issue_comments(repo: &str, pr: u64) -> anyhow::Result<Vec<OpenIssueComm
     ];
     let issue_json = run_gh_json_command(&args)?;
     parse_issue_comments(issue_json)
+}
+
+fn fetch_open_issues_by_label(
+    repo: &str,
+    label: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<ProcessWatchIssue>> {
+    let args = vec![
+        "issue".to_string(),
+        "list".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--state".to_string(),
+        "open".to_string(),
+        "--label".to_string(),
+        label.to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+        "--json".to_string(),
+        "number,title,url".to_string(),
+    ];
+    let issues_json = run_gh_json_command(&args)?;
+    let raw_items: Vec<GhIssueListItem> = serde_json::from_value(issues_json)
+        .context("Failed to parse GitHub issue list response")?;
+    Ok(raw_items
+        .into_iter()
+        .map(|issue| ProcessWatchIssue {
+            number: issue.number,
+            title: issue.title,
+            url: issue.url,
+        })
+        .collect())
 }
 
 fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
@@ -1277,6 +1572,42 @@ fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
     serde_json::from_slice(&output.stdout).context("`gh` returned invalid JSON output")
 }
 
+fn run_gh_text_command(args: &[String]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `gh`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo access.",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("`gh` returned non-UTF8 output")?;
+    Ok(stdout.trim().to_string())
+}
+
 struct UnresolvedReviewCommentPage {
     comments: Vec<UnresolvedReviewComment>,
     has_next_page: bool,
@@ -1305,7 +1636,9 @@ fn parse_unresolved_review_comment_page(
         .and_then(|data| data.repository)
         .and_then(|repo| repo.pull_request)
         .map(|pr| pr.review_threads)
-        .ok_or_else(|| anyhow::anyhow!("GitHub GraphQL response did not include pull request review threads."))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("GitHub GraphQL response did not include pull request review threads.")
+        })?;
 
     let comments = review_threads
         .nodes
@@ -1314,7 +1647,9 @@ fn parse_unresolved_review_comment_page(
         .flat_map(|thread| thread.comments.nodes)
         .map(|comment| UnresolvedReviewComment {
             id: comment.id,
-            author: comment.author.map_or_else(|| "unknown".to_string(), |author| author.login),
+            author: comment
+                .author
+                .map_or_else(|| "unknown".to_string(), |author| author.login),
             path: comment.path,
             line: comment.line,
             body: comment.body,
@@ -1330,8 +1665,8 @@ fn parse_unresolved_review_comment_page(
 }
 
 fn parse_issue_comments(issue_json: serde_json::Value) -> anyhow::Result<Vec<OpenIssueComment>> {
-    let response: GhIssueCommentsResponse =
-        serde_json::from_value(issue_json).context("Failed to parse GitHub issue comments response")?;
+    let response: GhIssueCommentsResponse = serde_json::from_value(issue_json)
+        .context("Failed to parse GitHub issue comments response")?;
 
     let comments = match response {
         GhIssueCommentsResponse::Paged(pages) => pages.into_iter().flatten().collect(),
@@ -1349,6 +1684,86 @@ fn parse_issue_comments(issue_json: serde_json::Value) -> anyhow::Result<Vec<Ope
         .collect())
 }
 
+fn classify_comment_triage(body: &str) -> TriageDecision {
+    let normalized = body.to_ascii_lowercase();
+    if [
+        "follow-up",
+        "follow up",
+        "separate issue",
+        "tracking issue",
+        "out of scope",
+        "later",
+        "future work",
+        "tech debt",
+        "defer",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return TriageDecision::NeedsIssue;
+    }
+
+    if [
+        "nit",
+        "typo",
+        "rename",
+        "format",
+        "formatting",
+        "small fix",
+        "quick fix",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return TriageDecision::QuickFix;
+    }
+
+    if normalized.contains('?')
+        || normalized.starts_with("why ")
+        || normalized.starts_with("what ")
+        || normalized.starts_with("can ")
+        || normalized.starts_with("could ")
+    {
+        return TriageDecision::Question;
+    }
+
+    TriageDecision::QuickFix
+}
+
+fn create_follow_up_issue(
+    repo: &str,
+    pr: u64,
+    author: &str,
+    comment_url: &str,
+    comment_body: &str,
+) -> anyhow::Result<String> {
+    let mut title = format!("Follow-up from PR #{pr} comment by {author}");
+    let first_line = comment_body.lines().next().unwrap_or_default().trim();
+    if !first_line.is_empty() {
+        let truncated = first_line.chars().take(80).collect::<String>();
+        title = format!("{title}: {truncated}");
+    }
+
+    let body = format!(
+        "Created by `codex process pr-comments --act`.\n\nSource PR: https://github.com/{repo}/pull/{pr}\nSource comment: {comment_url}\n\nOriginal comment:\n\n{comment_body}\n"
+    );
+    let args = vec![
+        "issue".to_string(),
+        "create".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--title".to_string(),
+        title,
+        "--body".to_string(),
+        body,
+    ];
+    let issue_url = run_gh_text_command(&args)?;
+    if issue_url.starts_with("http://") || issue_url.starts_with("https://") {
+        return Ok(issue_url);
+    }
+    anyhow::bail!("`gh issue create` succeeded but did not return an issue URL: {issue_url}");
+}
+
 fn suggested_next_actions(grouped_by_type: &GroupedByType) -> Vec<String> {
     let mut actions = Vec::new();
     if grouped_by_type.unresolved_review_comments > 0 {
@@ -1358,11 +1773,31 @@ fn suggested_next_actions(grouped_by_type: &GroupedByType) -> Vec<String> {
         actions.push("Reply to open issue comments on the PR conversation.".to_string());
     }
     if grouped_by_type.total == 0 {
-        actions.push("No open comments found; proceed with final verification and merge checks.".to_string());
+        actions.push(
+            "No open comments found; proceed with final verification and merge checks.".to_string(),
+        );
     } else {
         actions.push("After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string());
     }
     actions
+}
+
+fn suggest_issue_watch_actions(open_issues: &[ProcessWatchIssue]) -> Vec<String> {
+    if open_issues.is_empty() {
+        return vec!["No matching open issues found.".to_string()];
+    }
+
+    open_issues
+        .iter()
+        .take(5)
+        .map(|issue| {
+            format!(
+                "Plan automation for issue #{number} ({url})",
+                number = issue.number,
+                url = issue.url.as_str()
+            )
+        })
+        .collect()
 }
 
 async fn enable_feature_in_config(interactive: &TuiCli, feature: &str) -> anyhow::Result<()> {
@@ -2063,11 +2498,61 @@ mod tests {
         let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
-        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr }) = sub else {
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr, act }) = sub else {
             panic!("expected process pr-comments");
         };
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(pr, 1);
+        assert!(!act);
+    }
+
+    #[test]
+    fn process_pr_comments_parses_act_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+            "--act",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { act, .. }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert!(act);
+    }
+
+    #[test]
+    fn process_issues_watch_parses_args() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--limit",
+            "20",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { repo, label, limit }) = sub;
+        assert_eq!(repo, "njfio/codex-process");
+        assert_eq!(label, "process:auto-fix");
+        assert_eq!(limit, 20);
     }
 
     #[test]
@@ -2082,6 +2567,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid --repo value `openai`. Expected `owner/name`."
+        );
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_rejects_too_many_path_segments() {
+        let err = parse_repo_owner_and_name("openai/codex/extra").expect_err("repo should fail");
+        assert_eq!(
+            err.to_string(),
+            "Invalid --repo value `openai/codex/extra`. Expected `owner/name`."
         );
     }
 
@@ -2200,7 +2694,10 @@ mod tests {
         };
         assert_eq!(
             suggested_next_actions(&empty),
-            vec!["No open comments found; proceed with final verification and merge checks.".to_string()]
+            vec![
+                "No open comments found; proceed with final verification and merge checks."
+                    .to_string()
+            ]
         );
 
         let non_empty = GroupedByType {
@@ -2216,6 +2713,25 @@ mod tests {
                 "After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn classify_comment_triage_prioritizes_needs_issue_keywords() {
+        let decision =
+            classify_comment_triage("This is out of scope for this PR, please open a follow-up.");
+        assert_eq!(decision, TriageDecision::NeedsIssue);
+    }
+
+    #[test]
+    fn classify_comment_triage_detects_question() {
+        let decision = classify_comment_triage("Can we simplify this flow?");
+        assert_eq!(decision, TriageDecision::Question);
+    }
+
+    #[test]
+    fn classify_comment_triage_defaults_to_quick_fix() {
+        let decision = classify_comment_triage("Please update this implementation detail.");
+        assert_eq!(decision, TriageDecision::QuickFix);
     }
 
     #[test]

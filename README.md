@@ -58,10 +58,14 @@ This fork adds an experimental `process` command group to bootstrap process-nati
 codex process run --task "Implement X"
 codex process status --run-id <id>
 codex process pr-comments --repo owner/repo --pr 123
+codex process pr-comments --repo owner/repo --pr 123 --act
+codex process issues watch --repo owner/repo --label process:auto-fix --limit 20
 ```
 
 The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
-The `pr-comments` subcommand now performs live GitHub comment ingestion via `gh`, capturing unresolved PR review comments and issue comments into a structured `.process/runs/<run-id>/pr-comments.json` artifact.
+The `pr-comments` subcommand performs live GitHub comment ingestion via `gh`, capturing unresolved PR review comments and issue comments into `.process/runs/<run-id>/pr-comments.json`.
+Passing `--act` enables triage and follow-up issue creation: comments are classified (`quick_fix`, `needs_issue`, `question`) and written to `.process/runs/<run-id>/triage.json`, with `needs_issue` items opened via `gh issue create` and linked in the artifact.
+The `issues watch` subcommand fetches matching open issues and writes `.process/runs/<run-id>/issues-watch.json` with `fetchedAt`, `repo`, `label`, `openIssues[]`, and `suggestedActions[]`.
 
 ## Docs
 
