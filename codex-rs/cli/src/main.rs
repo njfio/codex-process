@@ -1099,6 +1099,12 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_branch: None,
             quick_fix_commit_sha: None,
             quick_fix_commit_url: None,
+            quick_fix_pushed: None,
+            quick_fix_remote_branch: None,
+            quick_fix_pr_url: None,
+            quick_fix_pr_number: None,
+            quick_fix_push_error: None,
+            quick_fix_pr_error: None,
         })
         .collect::<Vec<_>>();
     triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
@@ -1118,6 +1124,12 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_branch: None,
             quick_fix_commit_sha: None,
             quick_fix_commit_url: None,
+            quick_fix_pushed: None,
+            quick_fix_remote_branch: None,
+            quick_fix_pr_url: None,
+            quick_fix_pr_number: None,
+            quick_fix_push_error: None,
+            quick_fix_pr_error: None,
         }
     }));
 
@@ -1134,6 +1146,16 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             )
         });
     let quick_fix_base_sha = current_git_head_sha();
+    let quick_fix_pr_base_branch = match fetch_pr_base_branch_name(&args.repo, args.pr) {
+        Ok(branch) => branch,
+        Err(err) => {
+            eprintln!(
+                "Warning: unable to determine source PR base branch for #{pr}: {err}; defaulting to `main` for follow-up PRs.",
+                pr = args.pr
+            );
+            None
+        }
+    };
     for item in &mut triage_items {
         match item.decision {
             TriageDecision::QuickFix => {
@@ -1149,6 +1171,12 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         branch_name: None,
                         commit_sha: None,
                         commit_url: None,
+                        pushed: None,
+                        remote_branch: None,
+                        follow_up_pr_url: None,
+                        follow_up_pr_number: None,
+                        push_error: None,
+                        pr_error: None,
                     }
                 } else if let Ok(base_sha) = &quick_fix_base_sha {
                     run_quick_fix_item_in_isolated_branch(
@@ -1157,6 +1185,7 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         item,
                         base_sha,
                         &quick_fix_worktree_root,
+                        quick_fix_pr_base_branch.as_deref().unwrap_or("main"),
                     )
                 } else {
                     QuickFixExecutionResult {
@@ -1175,6 +1204,12 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         branch_name: None,
                         commit_sha: None,
                         commit_url: None,
+                        pushed: None,
+                        remote_branch: None,
+                        follow_up_pr_url: None,
+                        follow_up_pr_number: None,
+                        push_error: None,
+                        pr_error: None,
                     }
                 };
                 let execution_summary = if execution.success {
@@ -1194,6 +1229,12 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                 item.quick_fix_branch = execution.branch_name.clone();
                 item.quick_fix_commit_sha = execution.commit_sha.clone();
                 item.quick_fix_commit_url = execution.commit_url.clone();
+                item.quick_fix_pushed = execution.pushed;
+                item.quick_fix_remote_branch = execution.remote_branch.clone();
+                item.quick_fix_pr_url = execution.follow_up_pr_url.clone();
+                item.quick_fix_pr_number = execution.follow_up_pr_number;
+                item.quick_fix_push_error = execution.push_error.clone();
+                item.quick_fix_pr_error = execution.pr_error.clone();
                 if execution.success {
                     let summary = execution_summary
                         .unwrap_or_else(|| "Applied targeted quick fix.".to_string());
@@ -1204,6 +1245,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         verification: execution.verification,
                         commit_sha: execution.commit_sha,
                         commit_url: execution.commit_url,
+                        follow_up_pr_url: execution.follow_up_pr_url,
+                        follow_up_pr_number: execution.follow_up_pr_number,
                     });
                 } else {
                     item.todo = Some(format!(
@@ -1344,6 +1387,12 @@ struct ProcessCommentTriageItem {
     quick_fix_branch: Option<String>,
     quick_fix_commit_sha: Option<String>,
     quick_fix_commit_url: Option<String>,
+    quick_fix_pushed: Option<bool>,
+    quick_fix_remote_branch: Option<String>,
+    quick_fix_pr_url: Option<String>,
+    quick_fix_pr_number: Option<u64>,
+    quick_fix_push_error: Option<String>,
+    quick_fix_pr_error: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
@@ -1385,6 +1434,12 @@ struct QuickFixExecutionResult {
     branch_name: Option<String>,
     commit_sha: Option<String>,
     commit_url: Option<String>,
+    pushed: Option<bool>,
+    remote_branch: Option<String>,
+    follow_up_pr_url: Option<String>,
+    follow_up_pr_number: Option<u64>,
+    push_error: Option<String>,
+    pr_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1395,6 +1450,8 @@ struct QuickFixSummary {
     verification: Option<String>,
     commit_sha: Option<String>,
     commit_url: Option<String>,
+    follow_up_pr_url: Option<String>,
+    follow_up_pr_number: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1402,6 +1459,12 @@ struct ParsedQuickFixOutput {
     summary: Option<String>,
     files: Vec<String>,
     verification: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedGhPrCreateOutput {
+    url: Option<String>,
+    number: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
@@ -1518,6 +1581,12 @@ struct GhIssueListItem {
     number: u64,
     title: String,
     url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPrBaseRefResponse {
+    base_ref_name: String,
 }
 
 fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
@@ -1678,6 +1747,25 @@ fn fetch_open_issues_by_label(
             url: issue.url,
         })
         .collect())
+}
+
+fn fetch_pr_base_branch_name(repo: &str, pr: u64) -> anyhow::Result<Option<String>> {
+    let args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        pr.to_string(),
+        "--json".to_string(),
+        "baseRefName".to_string(),
+    ];
+    let json = run_gh_json_command(&args)?;
+    let parsed: GhPrBaseRefResponse =
+        serde_json::from_value(json).context("Failed to parse PR base branch response")?;
+    if parsed.base_ref_name.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parsed.base_ref_name))
 }
 
 fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
@@ -1895,6 +1983,12 @@ fn run_quick_fix_subprocess(
                 branch_name: None,
                 commit_sha: None,
                 commit_url: None,
+                pushed: None,
+                remote_branch: None,
+                follow_up_pr_url: None,
+                follow_up_pr_number: None,
+                push_error: None,
+                pr_error: None,
             };
         }
     };
@@ -1920,6 +2014,12 @@ fn run_quick_fix_subprocess(
                 branch_name: None,
                 commit_sha: None,
                 commit_url: None,
+                pushed: None,
+                remote_branch: None,
+                follow_up_pr_url: None,
+                follow_up_pr_number: None,
+                push_error: None,
+                pr_error: None,
             };
         }
     };
@@ -1943,6 +2043,12 @@ fn run_quick_fix_subprocess(
             branch_name: None,
             commit_sha: None,
             commit_url: None,
+            pushed: None,
+            remote_branch: None,
+            follow_up_pr_url: None,
+            follow_up_pr_number: None,
+            push_error: None,
+            pr_error: None,
         };
     }
 
@@ -1965,6 +2071,12 @@ fn run_quick_fix_subprocess(
         branch_name: None,
         commit_sha: None,
         commit_url: None,
+        pushed: None,
+        remote_branch: None,
+        follow_up_pr_url: None,
+        follow_up_pr_number: None,
+        push_error: None,
+        pr_error: None,
     }
 }
 
@@ -1981,6 +2093,7 @@ fn run_quick_fix_item_in_isolated_branch(
     item: &ProcessCommentTriageItem,
     base_sha: &str,
     worktree_root: &std::path::Path,
+    follow_up_pr_base_branch: &str,
 ) -> QuickFixExecutionResult {
     let branch_name = quick_fix_branch_name(pr, &item.comment_id);
     let worktree_dir = worktree_root.join(quick_fix_worktree_dir_name(&branch_name));
@@ -1998,6 +2111,12 @@ fn run_quick_fix_item_in_isolated_branch(
             branch_name: Some(branch_name),
             commit_sha: None,
             commit_url: None,
+            pushed: None,
+            remote_branch: None,
+            follow_up_pr_url: None,
+            follow_up_pr_number: None,
+            push_error: None,
+            pr_error: None,
         };
     }
 
@@ -2012,7 +2131,6 @@ fn run_quick_fix_item_in_isolated_branch(
             execution.branch_name = Some(metadata.branch_name);
             execution.commit_sha = Some(metadata.commit_sha);
             execution.commit_url = Some(metadata.commit_url);
-            execution
         }
         Err(err) => {
             execution.success = false;
@@ -2022,9 +2140,85 @@ fn run_quick_fix_item_in_isolated_branch(
             ));
             execution.commit_sha = None;
             execution.commit_url = None;
-            execution
+            return execution;
         }
     }
+
+    if let Some(push_error) = push_quick_fix_branch(&worktree_dir, &branch_name).err() {
+        execution.pushed = Some(false);
+        execution.remote_branch = Some(branch_name);
+        execution.push_error = Some(push_error.to_string());
+        execution.pr_error = Some("Skipped PR creation because branch push failed.".to_string());
+        return execution;
+    }
+
+    execution.pushed = Some(true);
+    execution.remote_branch = Some(branch_name.clone());
+    let pr_result = create_quick_fix_follow_up_pr(
+        repo,
+        pr,
+        follow_up_pr_base_branch,
+        item,
+        &branch_name,
+        execution.commit_url.as_deref(),
+    );
+    match pr_result {
+        Ok((pr_url, pr_number)) => {
+            execution.follow_up_pr_url = Some(pr_url);
+            execution.follow_up_pr_number = pr_number;
+        }
+        Err(err) => {
+            execution.pr_error = Some(err.to_string());
+        }
+    }
+    execution
+}
+
+fn push_quick_fix_branch(worktree_dir: &std::path::Path, branch_name: &str) -> anyhow::Result<()> {
+    let args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "push".to_string(),
+        "-u".to_string(),
+        "origin".to_string(),
+        branch_name.to_string(),
+    ];
+    run_git_text_command(&args).map(|_| ())
+}
+
+fn create_quick_fix_follow_up_pr(
+    repo: &str,
+    pr: u64,
+    base_branch: &str,
+    item: &ProcessCommentTriageItem,
+    head_branch: &str,
+    commit_url: Option<&str>,
+) -> anyhow::Result<(String, Option<u64>)> {
+    let title = quick_fix_commit_message(pr, &item.comment_id);
+    let body = format_quick_fix_follow_up_pr_body(repo, pr, item, commit_url);
+    let body_file = write_temp_markdown_file("codex-follow-up-pr", &body)?;
+    let args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--base".to_string(),
+        base_branch.to_string(),
+        "--head".to_string(),
+        head_branch.to_string(),
+        "--title".to_string(),
+        title,
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let create_output = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let create_output = create_output?;
+    let parsed = parse_gh_pr_create_output(&create_output);
+    let Some(pr_url) = parsed.url else {
+        anyhow::bail!("`gh pr create` succeeded but did not return a PR URL: {create_output}");
+    };
+    Ok((pr_url, parsed.number))
 }
 
 fn create_quick_fix_worktree(
@@ -2290,6 +2484,13 @@ fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
                 short_commit_sha(commit_sha)
             ));
         }
+        if let Some(pr_url) = &item.follow_up_pr_url {
+            if let Some(pr_number) = item.follow_up_pr_number {
+                line.push_str(&format!("; follow-up PR: [#{pr_number}]({pr_url})"));
+            } else {
+                line.push_str(&format!("; follow-up PR: {pr_url}"));
+            }
+        }
         body.push_str(&line);
         body.push('\n');
     }
@@ -2314,6 +2515,65 @@ fn extract_first_url(text: &str) -> Option<String> {
         }
         None
     })
+}
+
+fn parse_pr_number_from_url(url: &str) -> Option<u64> {
+    let (_, suffix) = url.split_once("/pull/")?;
+    let digits = suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn parse_pr_number_from_text(text: &str) -> Option<u64> {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|ch: char| "[](){}<>:;,.!?".contains(ch));
+        if let Some(number) = trimmed.strip_prefix('#')
+            && !number.is_empty()
+            && number.chars().all(|ch| ch.is_ascii_digit())
+            && let Ok(parsed) = number.parse::<u64>()
+        {
+            return Some(parsed);
+        }
+        if let Some((_, number)) = trimmed.split_once("/pull/") {
+            let digits = number
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if !digits.is_empty()
+                && let Ok(parsed) = digits.parse::<u64>()
+            {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn parse_gh_pr_create_output(text: &str) -> ParsedGhPrCreateOutput {
+    let url = text
+        .split_whitespace()
+        .filter_map(|token| {
+            if token.starts_with("https://") || token.starts_with("http://") {
+                return Some(
+                    token
+                        .trim_end_matches(|ch: char| ",.)]".contains(ch))
+                        .to_string(),
+                );
+            }
+            None
+        })
+        .find(|url| url.contains("/pull/"))
+        .or_else(|| extract_first_url(text));
+    let number = url
+        .as_deref()
+        .and_then(parse_pr_number_from_url)
+        .or_else(|| parse_pr_number_from_text(text));
+    ParsedGhPrCreateOutput { url, number }
 }
 
 fn write_temp_markdown_file(prefix: &str, body: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -2351,6 +2611,25 @@ fn format_follow_up_issue_body(
         "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/{repo}/pull/{pr}\n- Source comment: {comment_url}\n\nOriginal comment:\n\n{quoted}\n",
         quoted = to_markdown_blockquote(comment_body),
     )
+}
+
+fn format_quick_fix_follow_up_pr_body(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    commit_url: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/{repo}/pull/{pr}\n- Source comment: {comment_url}\n",
+        comment_url = item.comment_url
+    );
+    if let Some(commit_url) = commit_url {
+        body.push_str(&format!("- Quick-fix commit: {commit_url}\n"));
+    }
+    body.push_str("\nOriginal comment:\n\n");
+    body.push_str(&to_markdown_blockquote(&item.body));
+    body.push('\n');
+    body
 }
 
 fn create_follow_up_issue(
@@ -3408,10 +3687,92 @@ mod tests {
             commit_url: Some(
                 "https://github.com/openai/codex-process/commit/0123456789abcdef".to_string(),
             ),
+            follow_up_pr_url: Some("https://github.com/openai/codex-process/pull/77".to_string()),
+            follow_up_pr_number: Some(77),
         }]);
         assert_eq!(
             body,
-            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef)\n"
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef); follow-up PR: [#77](https://github.com/openai/codex-process/pull/77)\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn parse_gh_pr_create_output_extracts_url_and_number() {
+        let parsed = parse_gh_pr_create_output(
+            "https://github.com/openai/codex-process/pull/88\nCreated pull request #88",
+        );
+        assert_eq!(
+            parsed,
+            ParsedGhPrCreateOutput {
+                url: Some("https://github.com/openai/codex-process/pull/88".to_string()),
+                number: Some(88),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gh_pr_create_output_extracts_number_when_only_hash_is_present() {
+        let parsed = parse_gh_pr_create_output("Created pull request #91");
+        assert_eq!(
+            parsed,
+            ParsedGhPrCreateOutput {
+                url: None,
+                number: Some(91),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gh_pr_create_output_prefers_pull_url_over_other_urls() {
+        let parsed = parse_gh_pr_create_output(
+            "Compare at https://github.com/openai/codex-process/compare/a...b and PR https://github.com/openai/codex-process/pull/99",
+        );
+        assert_eq!(
+            parsed,
+            ParsedGhPrCreateOutput {
+                url: Some("https://github.com/openai/codex-process/pull/99".to_string()),
+                number: Some(99),
+            }
+        );
+    }
+
+    #[test]
+    fn format_quick_fix_follow_up_pr_body_includes_required_links_and_optional_commit() {
+        let body = format_quick_fix_follow_up_pr_body(
+            "openai/codex-process",
+            42,
+            &ProcessCommentTriageItem {
+                source: "review_comment".to_string(),
+                comment_id: "PRRC_1".to_string(),
+                author: "reviewer".to_string(),
+                body: "Please tighten this check.".to_string(),
+                comment_url: "https://github.com/openai/codex-process/pull/42#discussion_r1"
+                    .to_string(),
+                decision: TriageDecision::QuickFix,
+                created_issue_url: None,
+                todo: None,
+                quick_fix_attempted: true,
+                quick_fix_success: Some(true),
+                quick_fix_summary: None,
+                quick_fix_error: None,
+                quick_fix_branch: Some("process/quick-fix-pr-42-prrc-1".to_string()),
+                quick_fix_commit_sha: Some("abc".to_string()),
+                quick_fix_commit_url: Some(
+                    "https://github.com/openai/codex-process/commit/abc".to_string(),
+                ),
+                quick_fix_pushed: Some(true),
+                quick_fix_remote_branch: Some("process/quick-fix-pr-42-prrc-1".to_string()),
+                quick_fix_pr_url: None,
+                quick_fix_pr_number: None,
+                quick_fix_push_error: None,
+                quick_fix_pr_error: None,
+            },
+            Some("https://github.com/openai/codex-process/commit/abc"),
+        );
+        assert_eq!(
+            body,
+            "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/openai/codex-process/pull/42\n- Source comment: https://github.com/openai/codex-process/pull/42#discussion_r1\n- Quick-fix commit: https://github.com/openai/codex-process/commit/abc\n\nOriginal comment:\n\n> Please tighten this check.\n"
                 .to_string()
         );
     }
