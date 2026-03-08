@@ -60,6 +60,7 @@ codex process status --run-id <id>
 codex process pr-comments --repo owner/repo --pr 123
 codex process pr-comments --repo owner/repo --pr 123 --act
 codex process issues watch --repo owner/repo --label process:auto-fix --limit 20
+codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act
 ```
 
 The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
@@ -69,6 +70,7 @@ For `quick_fix` items, Codex runs targeted `exec` subprocesses in isolated git w
 When at least one quick fix succeeds, the command posts one concise PR update comment through `gh pr comment` summarizing applied items (including files/verification status, commit links, and created follow-up PR links when available), and stores that comment URL in the triage artifact when it can be detected.
 For `needs_issue` items, follow-up issues are opened via `gh issue create` and linked in the artifact.
 The `issues watch` subcommand fetches matching open issues and writes `.process/runs/<run-id>/issues-watch.json` with `fetchedAt`, `repo`, `label`, `openIssues[]`, and `suggestedActions[]`.
+With `--act`, `issues watch` triages each issue (`quick_fix` or `needs_manual`) and isolates each quick-fix attempt so one issue failure does not abort the rest. Successful quick-fix attempts run targeted `codex exec` in an isolated worktree branch, commit/push changes, open a follow-up PR, and post a status comment back on the issue via `gh issue comment`. Non-successful attempts post a concise manual-follow-up comment with the failure reason. Action runs write `.process/runs/<run-id>/issues-watch-act.json` with `fetchedAt`, `repo`, `label`, and per-issue `issueActions[]` entries: `issueNumber`, `issueUrl`, `decision`, `attempted`, `success`, `branch`, `commitSha`, `commitUrl`, `prUrl`, `prNumber`, `updateCommentUrl`, and `error`.
 
 ## Docs
 
