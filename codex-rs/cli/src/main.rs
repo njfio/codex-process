@@ -617,6 +617,10 @@ struct ProcessIssuesWatchArgs {
     /// Max number of issues to fetch.
     #[arg(long, default_value_t = 20)]
     limit: u32,
+
+    /// Triage matching issues and attempt targeted quick-fix automation.
+    #[arg(long, default_value_t = false)]
+    act: bool,
 }
 
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
@@ -1496,6 +1500,11 @@ struct ParsedGhPrCreateOutput {
     number: Option<u64>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedGhIssueCommentOutput {
+    url: Option<String>,
+}
+
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessIssuesWatchArtifact {
@@ -1506,11 +1515,52 @@ struct ProcessIssuesWatchArtifact {
     suggested_actions: Vec<String>,
 }
 
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IssueWatchDecision {
+    QuickFix,
+    NeedsManual,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessIssuesWatchActIssueAction {
+    issue_number: u64,
+    issue_url: String,
+    decision: IssueWatchDecision,
+    attempted: bool,
+    success: bool,
+    branch: Option<String>,
+    commit_sha: Option<String>,
+    commit_url: Option<String>,
+    pr_url: Option<String>,
+    pr_number: Option<u64>,
+    update_comment_url: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessIssuesWatchActArtifact {
+    fetched_at: u64,
+    repo: String,
+    label: String,
+    issue_actions: Vec<ProcessIssuesWatchActIssueAction>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessWatchIssue {
     number: u64,
     title: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessWatchIssueCandidate {
+    number: u64,
+    title: String,
+    body: String,
     url: String,
 }
 
@@ -1634,6 +1684,7 @@ struct GhIssueCommentUser {
 struct GhIssueListItem {
     number: u64,
     title: String,
+    body: Option<String>,
     url: String,
 }
 
@@ -1641,6 +1692,17 @@ struct GhIssueListItem {
 #[serde(rename_all = "camelCase")]
 struct GhPrBaseRefResponse {
     base_ref_name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhRepoViewResponse {
+    default_branch_ref: Option<GhRepoDefaultBranchRef>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhRepoDefaultBranchRef {
+    name: String,
 }
 
 fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
@@ -1661,6 +1723,9 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
         .to_string();
     let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
     std::fs::create_dir_all(&run_dir)?;
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
 
     let issues =
         fetch_open_issues_by_label(&args.repo, &args.label, args.limit).with_context(|| {
@@ -1669,19 +1734,218 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
                 args.repo, args.label
             )
         })?;
+    let open_issues = issues
+        .iter()
+        .map(|issue| ProcessWatchIssue {
+            number: issue.number,
+            title: issue.title.clone(),
+            url: issue.url.clone(),
+        })
+        .collect::<Vec<_>>();
     let artifact = ProcessIssuesWatchArtifact {
-        fetched_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
+        fetched_at,
         repo: args.repo.clone(),
         label: args.label.clone(),
-        suggested_actions: suggest_issue_watch_actions(&issues),
-        open_issues: issues,
+        suggested_actions: suggest_issue_watch_actions(&open_issues),
+        open_issues,
     };
     std::fs::write(
         run_dir.join("issues-watch.json"),
         serde_json::to_string_pretty(&artifact)?,
     )?;
+
+    if args.act {
+        let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
+        let quick_fix_root_error =
+            std::fs::create_dir_all(&quick_fix_worktree_root)
+                .err()
+                .map(|err| {
+                    format!(
+                        "Unable to prepare quick-fix worktree directory {}: {err}",
+                        quick_fix_worktree_root.display()
+                    )
+                });
+        let quick_fix_base_sha = current_git_head_sha();
+        let quick_fix_pr_base_branch = match fetch_repo_default_branch_name(&args.repo) {
+            Ok(Some(branch)) => branch,
+            Ok(None) => "main".to_string(),
+            Err(err) => {
+                eprintln!(
+                    "Warning: unable to determine default branch for {}: {err}; using `main` for follow-up PRs.",
+                    args.repo
+                );
+                "main".to_string()
+            }
+        };
+
+        let mut issue_actions = Vec::new();
+        for issue in &issues {
+            let decision = classify_issue_watch_triage(issue);
+            let mut action = ProcessIssuesWatchActIssueAction {
+                issue_number: issue.number,
+                issue_url: issue.url.clone(),
+                decision,
+                attempted: false,
+                success: false,
+                branch: None,
+                commit_sha: None,
+                commit_url: None,
+                pr_url: None,
+                pr_number: None,
+                update_comment_url: None,
+                error: None,
+            };
+
+            match decision {
+                IssueWatchDecision::NeedsManual => {
+                    let reason = "Triaged as needs_manual for human follow-up (scope or risk is non-trivial).";
+                    let body = format_issue_watch_manual_follow_up_comment(reason);
+                    match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
+                        Ok(comment_url) => {
+                            action.update_comment_url = comment_url;
+                            action.error = Some(reason.to_string());
+                        }
+                        Err(err) => {
+                            action.error = Some(format!(
+                                "{reason} Failed to post issue update comment: {err}"
+                            ));
+                        }
+                    }
+                }
+                IssueWatchDecision::QuickFix => {
+                    let execution = if let Some(err) = &quick_fix_root_error {
+                        QuickFixExecutionResult {
+                            attempted: false,
+                            success: false,
+                            summary: None,
+                            error: Some(err.clone()),
+                            files: Vec::new(),
+                            verification: None,
+                            branch_name: None,
+                            commit_sha: None,
+                            commit_url: None,
+                            pushed: None,
+                            remote_branch: None,
+                            follow_up_pr_url: None,
+                            follow_up_pr_number: None,
+                            push_error: None,
+                            pr_error: None,
+                        }
+                    } else if let Ok(base_sha) = &quick_fix_base_sha {
+                        run_issue_watch_quick_fix_in_isolated_branch(
+                            &args.repo,
+                            issue,
+                            base_sha,
+                            &quick_fix_worktree_root,
+                            &run_id,
+                            &quick_fix_pr_base_branch,
+                        )
+                    } else {
+                        QuickFixExecutionResult {
+                            attempted: false,
+                            success: false,
+                            summary: None,
+                            error: Some(format!(
+                                "Unable to read current git HEAD for quick-fix branching: {}",
+                                quick_fix_base_sha.as_ref().err().map_or_else(
+                                    || "unknown error".to_string(),
+                                    ToString::to_string
+                                )
+                            )),
+                            files: Vec::new(),
+                            verification: None,
+                            branch_name: None,
+                            commit_sha: None,
+                            commit_url: None,
+                            pushed: None,
+                            remote_branch: None,
+                            follow_up_pr_url: None,
+                            follow_up_pr_number: None,
+                            push_error: None,
+                            pr_error: None,
+                        }
+                    };
+
+                    action.attempted = execution.attempted;
+                    action.success = execution.success;
+                    action.branch = execution.branch_name.clone();
+                    action.commit_sha = execution.commit_sha.clone();
+                    action.commit_url = execution.commit_url.clone();
+                    action.pr_url = execution.follow_up_pr_url.clone();
+                    action.pr_number = execution.follow_up_pr_number;
+                    action.error = execution.error.clone();
+
+                    if execution.success {
+                        let body = format_issue_watch_success_comment(
+                            execution.summary.as_deref(),
+                            execution.follow_up_pr_url.as_deref(),
+                            execution.follow_up_pr_number,
+                            execution.commit_url.as_deref(),
+                        );
+                        match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
+                            Ok(comment_url) => {
+                                action.update_comment_url = comment_url;
+                            }
+                            Err(err) => {
+                                action.error = Some(format!(
+                                    "Quick fix completed, but failed to post issue update comment: {err}"
+                                ));
+                            }
+                        }
+                    } else {
+                        let reason = action
+                            .error
+                            .as_deref()
+                            .unwrap_or("Quick-fix attempt failed for an unknown reason.");
+                        let body = format_issue_watch_manual_follow_up_comment(reason);
+                        match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
+                            Ok(comment_url) => {
+                                action.update_comment_url = comment_url;
+                            }
+                            Err(err) => {
+                                action.error = Some(format!(
+                                    "{reason} Failed to post issue update comment: {err}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            issue_actions.push(action);
+        }
+
+        let act_artifact = ProcessIssuesWatchActArtifact {
+            fetched_at,
+            repo: args.repo.clone(),
+            label: args.label.clone(),
+            issue_actions,
+        };
+        std::fs::write(
+            run_dir.join("issues-watch-act.json"),
+            serde_json::to_string_pretty(&act_artifact)?,
+        )?;
+
+        let success_count = act_artifact
+            .issue_actions
+            .iter()
+            .filter(|action| action.success)
+            .count();
+        let attempted_count = act_artifact
+            .issue_actions
+            .iter()
+            .filter(|action| action.attempted)
+            .count();
+        println!("Issues watch action run created: {run_id}");
+        println!("Target: {} [{}]", args.repo, args.label);
+        println!("Open issues fetched: {}", artifact.open_issues.len());
+        println!("Quick-fix attempted: {attempted_count}");
+        println!("Quick-fix success: {success_count}");
+        println!(
+            "Artifact: {}",
+            run_dir.join("issues-watch-act.json").display()
+        );
+        return Ok(());
+    }
 
     println!("Issues watch run created: {run_id}");
     println!("Target: {} [{}]", args.repo, args.label);
@@ -1776,7 +2040,7 @@ fn fetch_open_issues_by_label(
     repo: &str,
     label: &str,
     limit: u32,
-) -> anyhow::Result<Vec<ProcessWatchIssue>> {
+) -> anyhow::Result<Vec<ProcessWatchIssueCandidate>> {
     let args = vec![
         "issue".to_string(),
         "list".to_string(),
@@ -1789,19 +2053,37 @@ fn fetch_open_issues_by_label(
         "--limit".to_string(),
         limit.to_string(),
         "--json".to_string(),
-        "number,title,url".to_string(),
+        "number,title,body,url".to_string(),
     ];
     let issues_json = run_gh_json_command(&args)?;
     let raw_items: Vec<GhIssueListItem> = serde_json::from_value(issues_json)
         .context("Failed to parse GitHub issue list response")?;
     Ok(raw_items
         .into_iter()
-        .map(|issue| ProcessWatchIssue {
+        .map(|issue| ProcessWatchIssueCandidate {
             number: issue.number,
             title: issue.title,
+            body: issue.body.unwrap_or_default(),
             url: issue.url,
         })
         .collect())
+}
+
+fn fetch_repo_default_branch_name(repo: &str) -> anyhow::Result<Option<String>> {
+    let args = vec![
+        "repo".to_string(),
+        "view".to_string(),
+        repo.to_string(),
+        "--json".to_string(),
+        "defaultBranchRef".to_string(),
+    ];
+    let json = run_gh_json_command(&args)?;
+    let parsed: GhRepoViewResponse = serde_json::from_value(json)
+        .context("Failed to parse repository default branch response")?;
+    Ok(parsed
+        .default_branch_ref
+        .map(|branch| branch.name.trim().to_string())
+        .filter(|branch| !branch.is_empty()))
 }
 
 fn fetch_pr_base_branch_name(repo: &str, pr: u64) -> anyhow::Result<Option<String>> {
@@ -2077,6 +2359,243 @@ fn classify_comment_triage(body: &str) -> TriageDecision {
     TriageDecision::QuickFix
 }
 
+fn classify_issue_watch_triage(issue: &ProcessWatchIssueCandidate) -> IssueWatchDecision {
+    let combined = format!("{} {}", issue.title, issue.body).to_ascii_lowercase();
+    if [
+        "typo",
+        "docs",
+        "documentation",
+        "readme",
+        "format",
+        "formatting",
+        "lint",
+        "rename",
+        "nit",
+        "small fix",
+        "quick fix",
+        "spelling",
+        "comment",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+    {
+        return IssueWatchDecision::QuickFix;
+    }
+    IssueWatchDecision::NeedsManual
+}
+
+fn run_issue_watch_quick_fix_subprocess(
+    issue: &ProcessWatchIssueCandidate,
+    work_dir: &std::path::Path,
+) -> QuickFixExecutionResult {
+    let prompt = build_issue_watch_quick_fix_prompt(issue);
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            return QuickFixExecutionResult {
+                attempted: false,
+                success: false,
+                summary: None,
+                error: Some(format!(
+                    "Unable to locate current executable for issue quick-fix run: {err}"
+                )),
+                files: Vec::new(),
+                verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
+                pushed: None,
+                remote_branch: None,
+                follow_up_pr_url: None,
+                follow_up_pr_number: None,
+                push_error: None,
+                pr_error: None,
+            };
+        }
+    };
+    let output = match std::process::Command::new(executable)
+        .args(["exec", "--skip-git-repo-check", "--full-auto", &prompt])
+        .current_dir(work_dir)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let error = if err.kind() == ErrorKind::NotFound {
+                "Unable to execute current binary for issue quick-fix run.".to_string()
+            } else {
+                format!("Failed to launch issue quick-fix subprocess: {err}")
+            };
+            return QuickFixExecutionResult {
+                attempted: true,
+                success: false,
+                summary: None,
+                error: Some(error),
+                files: Vec::new(),
+                verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
+                pushed: None,
+                remote_branch: None,
+                follow_up_pr_url: None,
+                follow_up_pr_number: None,
+                push_error: None,
+                pr_error: None,
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed = parse_quick_fix_output(&stdout);
+    let summary = parsed
+        .summary
+        .or_else(|| first_non_empty_line(&stdout))
+        .or_else(|| first_non_empty_line(&stderr));
+
+    if output.status.success() {
+        return QuickFixExecutionResult {
+            attempted: true,
+            success: true,
+            summary,
+            error: None,
+            files: parsed.files,
+            verification: parsed.verification,
+            branch_name: None,
+            commit_sha: None,
+            commit_url: None,
+            pushed: None,
+            remote_branch: None,
+            follow_up_pr_url: None,
+            follow_up_pr_number: None,
+            push_error: None,
+            pr_error: None,
+        };
+    }
+
+    let status = output.status.code().map_or_else(
+        || "terminated by signal".to_string(),
+        |code| code.to_string(),
+    );
+    let detail = first_non_empty_line(&stderr)
+        .or_else(|| first_non_empty_line(&stdout))
+        .unwrap_or_else(|| "subprocess returned no output".to_string());
+    QuickFixExecutionResult {
+        attempted: true,
+        success: false,
+        summary,
+        error: Some(format!(
+            "Issue quick-fix subprocess failed (status {status}): {detail}"
+        )),
+        files: parsed.files,
+        verification: parsed.verification,
+        branch_name: None,
+        commit_sha: None,
+        commit_url: None,
+        pushed: None,
+        remote_branch: None,
+        follow_up_pr_url: None,
+        follow_up_pr_number: None,
+        push_error: None,
+        pr_error: None,
+    }
+}
+
+fn run_issue_watch_quick_fix_in_isolated_branch(
+    repo: &str,
+    issue: &ProcessWatchIssueCandidate,
+    base_sha: &str,
+    worktree_root: &std::path::Path,
+    run_id: &str,
+    follow_up_pr_base_branch: &str,
+) -> QuickFixExecutionResult {
+    let branch_name = issue_watch_quick_fix_branch_name(issue.number, run_id);
+    let worktree_dir = worktree_root.join(quick_fix_worktree_dir_name(&branch_name));
+    if let Err(err) = create_quick_fix_worktree(&worktree_dir, &branch_name, base_sha) {
+        return QuickFixExecutionResult {
+            attempted: false,
+            success: false,
+            summary: None,
+            error: Some(format!(
+                "Unable to create isolated worktree for issue #{issue_number}: {err}",
+                issue_number = issue.number
+            )),
+            files: Vec::new(),
+            verification: None,
+            branch_name: Some(branch_name),
+            commit_sha: None,
+            commit_url: None,
+            pushed: None,
+            remote_branch: None,
+            follow_up_pr_url: None,
+            follow_up_pr_number: None,
+            push_error: None,
+            pr_error: None,
+        };
+    }
+
+    let mut execution = run_issue_watch_quick_fix_subprocess(issue, &worktree_dir);
+    execution.branch_name = Some(branch_name.clone());
+    if !execution.success {
+        return execution;
+    }
+
+    match commit_issue_watch_quick_fix_changes(repo, issue, &branch_name, &worktree_dir) {
+        Ok(metadata) => {
+            execution.branch_name = Some(metadata.branch_name);
+            execution.commit_sha = Some(metadata.commit_sha);
+            execution.commit_url = Some(metadata.commit_url);
+        }
+        Err(err) => {
+            execution.success = false;
+            execution.error = Some(format!(
+                "Issue quick-fix commit step failed for issue #{issue_number}: {err}",
+                issue_number = issue.number
+            ));
+            execution.commit_sha = None;
+            execution.commit_url = None;
+            return execution;
+        }
+    }
+
+    if let Some(push_error) = push_quick_fix_branch(&worktree_dir, &branch_name).err() {
+        execution.success = false;
+        execution.pushed = Some(false);
+        execution.remote_branch = Some(branch_name);
+        execution.push_error = Some(push_error.to_string());
+        execution.error = Some(format!(
+            "Issue quick-fix push failed for issue #{issue_number}: {push_error}",
+            issue_number = issue.number
+        ));
+        return execution;
+    }
+
+    execution.pushed = Some(true);
+    execution.remote_branch = Some(branch_name.clone());
+    match create_issue_watch_follow_up_pr(
+        repo,
+        follow_up_pr_base_branch,
+        issue,
+        &branch_name,
+        execution.commit_url.as_deref(),
+    ) {
+        Ok((pr_url, pr_number)) => {
+            execution.follow_up_pr_url = Some(pr_url);
+            execution.follow_up_pr_number = pr_number;
+        }
+        Err(err) => {
+            execution.success = false;
+            execution.pr_error = Some(err.to_string());
+            execution.error = Some(format!(
+                "Issue quick-fix PR creation failed for issue #{issue_number}: {err}",
+                issue_number = issue.number
+            ));
+        }
+    }
+
+    execution
+}
+
 fn run_quick_fix_subprocess(
     repo: &str,
     pr: u64,
@@ -2337,6 +2856,40 @@ fn create_quick_fix_follow_up_pr(
     Ok((pr_url, parsed.number))
 }
 
+fn create_issue_watch_follow_up_pr(
+    repo: &str,
+    base_branch: &str,
+    issue: &ProcessWatchIssueCandidate,
+    head_branch: &str,
+    commit_url: Option<&str>,
+) -> anyhow::Result<(String, Option<u64>)> {
+    let title = issue_watch_quick_fix_commit_message(issue.number);
+    let body = format_issue_watch_follow_up_pr_body(repo, issue, commit_url);
+    let body_file = write_temp_markdown_file("codex-issues-watch-follow-up-pr", &body)?;
+    let args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--base".to_string(),
+        base_branch.to_string(),
+        "--head".to_string(),
+        head_branch.to_string(),
+        "--title".to_string(),
+        title,
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let create_output = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let create_output = create_output?;
+    let parsed = parse_gh_pr_create_output(&create_output);
+    let Some(pr_url) = parsed.url else {
+        anyhow::bail!("`gh pr create` succeeded but did not return a PR URL: {create_output}");
+    };
+    Ok((pr_url, parsed.number))
+}
+
 fn create_quick_fix_worktree(
     worktree_dir: &std::path::Path,
     branch_name: &str,
@@ -2382,6 +2935,49 @@ fn commit_quick_fix_changes(
         "commit".to_string(),
         "-m".to_string(),
         quick_fix_commit_message(pr, &item.comment_id),
+    ];
+    run_git_text_command(&commit_args)?;
+
+    let sha_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "rev-parse".to_string(),
+        "HEAD".to_string(),
+    ];
+    let commit_sha = run_git_text_command(&sha_args)?;
+
+    Ok(QuickFixCommitMetadata {
+        branch_name: branch_name.to_string(),
+        commit_url: quick_fix_commit_url(repo, &commit_sha),
+        commit_sha,
+    })
+}
+
+fn commit_issue_watch_quick_fix_changes(
+    repo: &str,
+    issue: &ProcessWatchIssueCandidate,
+    branch_name: &str,
+    worktree_dir: &std::path::Path,
+) -> anyhow::Result<QuickFixCommitMetadata> {
+    let add_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "add".to_string(),
+        "-A".to_string(),
+    ];
+    run_git_text_command(&add_args)?;
+
+    let has_changes = git_has_staged_changes(worktree_dir)?;
+    if !has_changes {
+        anyhow::bail!("no changes were produced to commit");
+    }
+
+    let commit_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "commit".to_string(),
+        "-m".to_string(),
+        issue_watch_quick_fix_commit_message(issue.number),
     ];
     run_git_text_command(&commit_args)?;
 
@@ -2469,6 +3065,10 @@ fn quick_fix_commit_message(pr: u64, comment_id: &str) -> String {
     format!("process: quick fix for PR #{pr} comment {comment_id}")
 }
 
+fn issue_watch_quick_fix_commit_message(issue_number: u64) -> String {
+    format!("process: quick fix for issue #{issue_number}")
+}
+
 fn quick_fix_commit_url(repo: &str, sha: &str) -> String {
     format!("https://github.com/{repo}/commit/{sha}")
 }
@@ -2476,6 +3076,18 @@ fn quick_fix_commit_url(repo: &str, sha: &str) -> String {
 fn quick_fix_branch_name(pr: u64, comment_id: &str) -> String {
     let short = short_comment_id_for_branch(comment_id);
     format!("process/quick-fix-pr-{pr}-{short}")
+}
+
+fn issue_watch_quick_fix_branch_name(issue_number: u64, run_id: &str) -> String {
+    let suffix = run_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("process/quick-fix-issue-{issue_number}-{suffix}")
 }
 
 fn quick_fix_worktree_dir_name(branch_name: &str) -> String {
@@ -2513,6 +3125,18 @@ fn build_quick_fix_prompt(repo: &str, pr: u64, item: &ProcessCommentTriageItem) 
         "You are applying a minimal targeted fix in this repository.\n\nRepository: {repo}\nPR number: {pr}\nComment URL: {comment_url}\nComment body:\n{comment_body}\n\nRequirements:\n- Apply the smallest safe change that addresses the comment.\n- Keep scope tight to this comment only.\n- If verification is quick, run only focused checks.\n- Return exactly these lines at the end:\nSUMMARY: <one-line summary>\nFILES: <comma-separated file paths or none>\nVERIFICATION: <short status or none>",
         comment_url = item.comment_url,
         comment_body = bounded_body,
+    )
+}
+
+fn build_issue_watch_quick_fix_prompt(issue: &ProcessWatchIssueCandidate) -> String {
+    let trimmed_body = issue.body.trim();
+    let bounded_body = trimmed_body.chars().take(2_000).collect::<String>();
+    format!(
+        "You are applying a minimal targeted fix in this repository.\n\nIssue number: {issue_number}\nIssue URL: {issue_url}\nIssue title: {issue_title}\nIssue body:\n{issue_body}\n\nRequirements:\n- Apply the smallest safe change that resolves this issue.\n- Keep scope tight to this issue only.\n- If verification is quick, run only focused checks.\n- Return exactly these lines at the end:\nSUMMARY: <one-line summary>\nFILES: <comma-separated file paths or none>\nVERIFICATION: <short status or none>",
+        issue_number = issue.number,
+        issue_url = issue.url.as_str(),
+        issue_title = issue.title.as_str(),
+        issue_body = bounded_body,
     )
 }
 
@@ -2580,6 +3204,28 @@ fn post_quick_fix_pr_update_comment(
     let _ = std::fs::remove_file(&body_file);
     let text = result?;
     Ok(extract_first_url(&text))
+}
+
+fn post_issue_watch_update_comment(
+    repo: &str,
+    issue_number: u64,
+    body: &str,
+) -> anyhow::Result<Option<String>> {
+    let body_file = write_temp_markdown_file("codex-issues-watch-update", body)?;
+    let args = vec![
+        "issue".to_string(),
+        "comment".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        issue_number.to_string(),
+        "--body-file".to_string(),
+        body_file.display().to_string(),
+    ];
+    let result = run_gh_text_command(&args);
+    let _ = std::fs::remove_file(&body_file);
+    let text = result?;
+    let parsed = parse_gh_issue_comment_output(&text);
+    Ok(parsed.url)
 }
 
 fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
@@ -2702,6 +3348,23 @@ fn parse_gh_pr_create_output(text: &str) -> ParsedGhPrCreateOutput {
     ParsedGhPrCreateOutput { url, number }
 }
 
+fn parse_gh_issue_comment_output(text: &str) -> ParsedGhIssueCommentOutput {
+    let url = text
+        .split_whitespace()
+        .filter_map(|token| {
+            if token.starts_with("https://") || token.starts_with("http://") {
+                return Some(
+                    token
+                        .trim_end_matches(|ch: char| ",.)]".contains(ch))
+                        .to_string(),
+                );
+            }
+            None
+        })
+        .find(|candidate| candidate.contains("/issues/") && candidate.contains("#issuecomment-"));
+    ParsedGhIssueCommentOutput { url }
+}
+
 fn write_temp_markdown_file(prefix: &str, body: &str) -> anyhow::Result<std::path::PathBuf> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -2756,6 +3419,56 @@ fn format_quick_fix_follow_up_pr_body(
     body.push_str(&to_markdown_blockquote(&item.body));
     body.push('\n');
     body
+}
+
+fn format_issue_watch_follow_up_pr_body(
+    repo: &str,
+    issue: &ProcessWatchIssueCandidate,
+    commit_url: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "Created by `codex process issues watch --act`.\n\n- Source issue: {issue_url}\n- Repository: https://github.com/{repo}\n",
+        issue_url = issue.url.as_str()
+    );
+    if let Some(commit_url) = commit_url {
+        body.push_str(&format!("- Quick-fix commit: {commit_url}\n"));
+    }
+    body.push_str("\nIssue summary:\n\n");
+    body.push_str(&format!(
+        "- #{issue_number}: {title}\n",
+        issue_number = issue.number,
+        title = issue.title.as_str()
+    ));
+    body
+}
+
+fn format_issue_watch_success_comment(
+    summary: Option<&str>,
+    pr_url: Option<&str>,
+    pr_number: Option<u64>,
+    commit_url: Option<&str>,
+) -> String {
+    let mut body = String::from("Automation update from `codex process issues watch --act`.\n\n");
+    if let Some(summary) = summary {
+        body.push_str(&format!("- Result: {summary}\n"));
+    } else {
+        body.push_str("- Result: Applied targeted quick fix.\n");
+    }
+    if let (Some(pr_url), Some(pr_number)) = (pr_url, pr_number) {
+        body.push_str(&format!("- Follow-up PR: [#{pr_number}]({pr_url})\n"));
+    } else if let Some(pr_url) = pr_url {
+        body.push_str(&format!("- Follow-up PR: {pr_url}\n"));
+    }
+    if let Some(commit_url) = commit_url {
+        body.push_str(&format!("- Commit: {commit_url}\n"));
+    }
+    body
+}
+
+fn format_issue_watch_manual_follow_up_comment(reason: &str) -> String {
+    format!(
+        "Automation update from `codex process issues watch --act`.\n\nManual follow-up needed: {reason}\n"
+    )
 }
 
 fn create_follow_up_issue(
@@ -3578,10 +4291,42 @@ mod tests {
         let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
             panic!("expected process issues");
         };
-        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { repo, label, limit }) = sub;
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs {
+            repo,
+            label,
+            limit,
+            act,
+        }) = sub;
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(label, "process:auto-fix");
         assert_eq!(limit, 20);
+        assert!(!act);
+    }
+
+    #[test]
+    fn process_issues_watch_parses_act_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--limit",
+            "20",
+            "--act",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { act, .. }) = sub;
+        assert!(act);
     }
 
     #[test]
@@ -3767,6 +4512,28 @@ mod tests {
     }
 
     #[test]
+    fn classify_issue_watch_triage_detects_small_change_keywords() {
+        let decision = classify_issue_watch_triage(&ProcessWatchIssueCandidate {
+            number: 10,
+            title: "Fix typo in docs".to_string(),
+            body: String::new(),
+            url: "https://github.com/openai/codex-process/issues/10".to_string(),
+        });
+        assert_eq!(decision, IssueWatchDecision::QuickFix);
+    }
+
+    #[test]
+    fn classify_issue_watch_triage_defaults_to_needs_manual() {
+        let decision = classify_issue_watch_triage(&ProcessWatchIssueCandidate {
+            number: 11,
+            title: "Refactor process engine".to_string(),
+            body: "This likely spans multiple crates.".to_string(),
+            url: "https://github.com/openai/codex-process/issues/11".to_string(),
+        });
+        assert_eq!(decision, IssueWatchDecision::NeedsManual);
+    }
+
+    #[test]
     fn parse_quick_fix_output_extracts_summary_files_and_verification() {
         let output = "SUMMARY: Rename local variable for clarity\nFILES: cli/src/main.rs, README.md\nVERIFICATION: not run";
         let parsed = parse_quick_fix_output(output);
@@ -3890,6 +4657,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_gh_issue_comment_output_extracts_issue_comment_url() {
+        let parsed = parse_gh_issue_comment_output(
+            "https://github.com/openai/codex-process/issues/42#issuecomment-9999",
+        );
+        assert_eq!(
+            parsed,
+            ParsedGhIssueCommentOutput {
+                url: Some(
+                    "https://github.com/openai/codex-process/issues/42#issuecomment-9999"
+                        .to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gh_issue_comment_output_ignores_non_issue_urls() {
+        let parsed = parse_gh_issue_comment_output(
+            "comment posted: https://github.com/openai/codex-process/pull/42#issuecomment-1000",
+        );
+        assert_eq!(parsed, ParsedGhIssueCommentOutput { url: None });
+    }
+
+    #[test]
+    fn parse_gh_issue_comment_output_prefers_issue_comment_url_when_multiple_urls_present() {
+        let parsed = parse_gh_issue_comment_output(
+            "Compare: https://github.com/openai/codex-process/compare/main...branch Comment: https://github.com/openai/codex-process/issues/42#issuecomment-123",
+        );
+        assert_eq!(
+            parsed,
+            ParsedGhIssueCommentOutput {
+                url: Some(
+                    "https://github.com/openai/codex-process/issues/42#issuecomment-123"
+                        .to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn parse_resolve_review_thread_response_accepts_resolved_thread() {
         let input = serde_json::json!({
             "data": {
@@ -3970,6 +4777,50 @@ mod tests {
         assert_eq!(
             body,
             "Created by `codex process pr-comments --act`.\n\n- Source PR: https://github.com/openai/codex-process/pull/42\n- Source comment: https://github.com/openai/codex-process/pull/42#discussion_r1\n- Quick-fix commit: https://github.com/openai/codex-process/commit/abc\n\nOriginal comment:\n\n> Please tighten this check.\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn format_issue_watch_follow_up_pr_body_includes_issue_and_commit_context() {
+        let body = format_issue_watch_follow_up_pr_body(
+            "openai/codex-process",
+            &ProcessWatchIssueCandidate {
+                number: 123,
+                title: "Fix docs typo in process mode".to_string(),
+                body: "Typo in README process section.".to_string(),
+                url: "https://github.com/openai/codex-process/issues/123".to_string(),
+            },
+            Some("https://github.com/openai/codex-process/commit/abc123"),
+        );
+        assert_eq!(
+            body,
+            "Created by `codex process issues watch --act`.\n\n- Source issue: https://github.com/openai/codex-process/issues/123\n- Repository: https://github.com/openai/codex-process\n- Quick-fix commit: https://github.com/openai/codex-process/commit/abc123\n\nIssue summary:\n\n- #123: Fix docs typo in process mode\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn format_issue_watch_manual_follow_up_comment_is_concise() {
+        let body = format_issue_watch_manual_follow_up_comment("requires architectural changes");
+        assert_eq!(
+            body,
+            "Automation update from `codex process issues watch --act`.\n\nManual follow-up needed: requires architectural changes\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn format_issue_watch_success_comment_includes_pr_and_commit_links() {
+        let body = format_issue_watch_success_comment(
+            Some("Updated docs and fixed typo"),
+            Some("https://github.com/openai/codex-process/pull/200"),
+            Some(200),
+            Some("https://github.com/openai/codex-process/commit/abc123"),
+        );
+        assert_eq!(
+            body,
+            "Automation update from `codex process issues watch --act`.\n\n- Result: Updated docs and fixed typo\n- Follow-up PR: [#200](https://github.com/openai/codex-process/pull/200)\n- Commit: https://github.com/openai/codex-process/commit/abc123\n"
                 .to_string()
         );
     }
