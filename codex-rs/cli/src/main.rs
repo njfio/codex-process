@@ -1096,6 +1096,9 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_success: None,
             quick_fix_summary: None,
             quick_fix_error: None,
+            quick_fix_branch: None,
+            quick_fix_commit_sha: None,
+            quick_fix_commit_url: None,
         })
         .collect::<Vec<_>>();
     triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
@@ -1112,17 +1115,68 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_success: None,
             quick_fix_summary: None,
             quick_fix_error: None,
+            quick_fix_branch: None,
+            quick_fix_commit_sha: None,
+            quick_fix_commit_url: None,
         }
     }));
 
     let mut grouped_by_decision = ProcessTriageCounts::default();
     let mut created_issues = Vec::new();
     let mut successful_quick_fixes = Vec::new();
+    let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
+    let quick_fix_root_error = std::fs::create_dir_all(&quick_fix_worktree_root)
+        .err()
+        .map(|err| {
+            format!(
+                "Unable to prepare quick-fix worktree directory {}: {err}",
+                quick_fix_worktree_root.display()
+            )
+        });
+    let quick_fix_base_sha = current_git_head_sha();
     for item in &mut triage_items {
         match item.decision {
             TriageDecision::QuickFix => {
                 grouped_by_decision.quick_fix += 1;
-                let execution = run_quick_fix_subprocess(&args.repo, args.pr, item);
+                let execution = if let Some(err) = &quick_fix_root_error {
+                    QuickFixExecutionResult {
+                        attempted: false,
+                        success: false,
+                        summary: None,
+                        error: Some(err.clone()),
+                        files: Vec::new(),
+                        verification: None,
+                        branch_name: None,
+                        commit_sha: None,
+                        commit_url: None,
+                    }
+                } else if let Ok(base_sha) = &quick_fix_base_sha {
+                    run_quick_fix_item_in_isolated_branch(
+                        &args.repo,
+                        args.pr,
+                        item,
+                        base_sha,
+                        &quick_fix_worktree_root,
+                    )
+                } else {
+                    QuickFixExecutionResult {
+                        attempted: false,
+                        success: false,
+                        summary: None,
+                        error: Some(format!(
+                            "Unable to read current git HEAD for quick-fix branching: {}",
+                            quick_fix_base_sha
+                                .as_ref()
+                                .err()
+                                .map_or_else(|| "unknown error".to_string(), ToString::to_string)
+                        )),
+                        files: Vec::new(),
+                        verification: None,
+                        branch_name: None,
+                        commit_sha: None,
+                        commit_url: None,
+                    }
+                };
                 let execution_summary = if execution.success {
                     Some(
                         execution
@@ -1137,6 +1191,9 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                 item.quick_fix_success = Some(execution.success);
                 item.quick_fix_summary = execution_summary.clone();
                 item.quick_fix_error = execution.error.clone();
+                item.quick_fix_branch = execution.branch_name.clone();
+                item.quick_fix_commit_sha = execution.commit_sha.clone();
+                item.quick_fix_commit_url = execution.commit_url.clone();
                 if execution.success {
                     let summary = execution_summary
                         .unwrap_or_else(|| "Applied targeted quick fix.".to_string());
@@ -1145,6 +1202,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         summary,
                         files: execution.files,
                         verification: execution.verification,
+                        commit_sha: execution.commit_sha,
+                        commit_url: execution.commit_url,
                     });
                 } else {
                     item.todo = Some(format!(
@@ -1282,6 +1341,9 @@ struct ProcessCommentTriageItem {
     quick_fix_success: Option<bool>,
     quick_fix_summary: Option<String>,
     quick_fix_error: Option<String>,
+    quick_fix_branch: Option<String>,
+    quick_fix_commit_sha: Option<String>,
+    quick_fix_commit_url: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
@@ -1320,6 +1382,9 @@ struct QuickFixExecutionResult {
     error: Option<String>,
     files: Vec<String>,
     verification: Option<String>,
+    branch_name: Option<String>,
+    commit_sha: Option<String>,
+    commit_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1328,6 +1393,8 @@ struct QuickFixSummary {
     summary: String,
     files: Vec<String>,
     verification: Option<String>,
+    commit_sha: Option<String>,
+    commit_url: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1810,6 +1877,7 @@ fn run_quick_fix_subprocess(
     repo: &str,
     pr: u64,
     item: &ProcessCommentTriageItem,
+    work_dir: &std::path::Path,
 ) -> QuickFixExecutionResult {
     let prompt = build_quick_fix_prompt(repo, pr, item);
     let executable = match std::env::current_exe() {
@@ -1824,11 +1892,15 @@ fn run_quick_fix_subprocess(
                 )),
                 files: Vec::new(),
                 verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
             };
         }
     };
     let output = match std::process::Command::new(executable)
         .args(["exec", "--skip-git-repo-check", "--full-auto", &prompt])
+        .current_dir(work_dir)
         .output()
     {
         Ok(output) => output,
@@ -1845,6 +1917,9 @@ fn run_quick_fix_subprocess(
                 error: Some(error),
                 files: Vec::new(),
                 verification: None,
+                branch_name: None,
+                commit_sha: None,
+                commit_url: None,
             };
         }
     };
@@ -1865,6 +1940,9 @@ fn run_quick_fix_subprocess(
             error: None,
             files: parsed.files,
             verification: parsed.verification,
+            branch_name: None,
+            commit_sha: None,
+            commit_url: None,
         };
     }
 
@@ -1884,7 +1962,238 @@ fn run_quick_fix_subprocess(
         )),
         files: parsed.files,
         verification: parsed.verification,
+        branch_name: None,
+        commit_sha: None,
+        commit_url: None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct QuickFixCommitMetadata {
+    branch_name: String,
+    commit_sha: String,
+    commit_url: String,
+}
+
+fn run_quick_fix_item_in_isolated_branch(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    base_sha: &str,
+    worktree_root: &std::path::Path,
+) -> QuickFixExecutionResult {
+    let branch_name = quick_fix_branch_name(pr, &item.comment_id);
+    let worktree_dir = worktree_root.join(quick_fix_worktree_dir_name(&branch_name));
+    if let Err(err) = create_quick_fix_worktree(&worktree_dir, &branch_name, base_sha) {
+        return QuickFixExecutionResult {
+            attempted: false,
+            success: false,
+            summary: None,
+            error: Some(format!(
+                "Unable to create isolated worktree for quick-fix item {comment_id}: {err}",
+                comment_id = item.comment_id
+            )),
+            files: Vec::new(),
+            verification: None,
+            branch_name: Some(branch_name),
+            commit_sha: None,
+            commit_url: None,
+        };
+    }
+
+    let mut execution = run_quick_fix_subprocess(repo, pr, item, &worktree_dir);
+    execution.branch_name = Some(branch_name.clone());
+    if !execution.success {
+        return execution;
+    }
+
+    match commit_quick_fix_changes(repo, pr, item, &branch_name, &worktree_dir) {
+        Ok(metadata) => {
+            execution.branch_name = Some(metadata.branch_name);
+            execution.commit_sha = Some(metadata.commit_sha);
+            execution.commit_url = Some(metadata.commit_url);
+            execution
+        }
+        Err(err) => {
+            execution.success = false;
+            execution.error = Some(format!(
+                "Quick-fix commit step failed for comment {comment_id}: {err}",
+                comment_id = item.comment_id
+            ));
+            execution.commit_sha = None;
+            execution.commit_url = None;
+            execution
+        }
+    }
+}
+
+fn create_quick_fix_worktree(
+    worktree_dir: &std::path::Path,
+    branch_name: &str,
+    base_sha: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = worktree_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let args = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "-b".to_string(),
+        branch_name.to_string(),
+        worktree_dir.display().to_string(),
+        base_sha.to_string(),
+    ];
+    run_git_text_command(&args).map(|_| ())
+}
+
+fn commit_quick_fix_changes(
+    repo: &str,
+    pr: u64,
+    item: &ProcessCommentTriageItem,
+    branch_name: &str,
+    worktree_dir: &std::path::Path,
+) -> anyhow::Result<QuickFixCommitMetadata> {
+    let add_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "add".to_string(),
+        "-A".to_string(),
+    ];
+    run_git_text_command(&add_args)?;
+
+    let has_changes = git_has_staged_changes(worktree_dir)?;
+    if !has_changes {
+        anyhow::bail!("no changes were produced to commit");
+    }
+
+    let commit_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "commit".to_string(),
+        "-m".to_string(),
+        quick_fix_commit_message(pr, &item.comment_id),
+    ];
+    run_git_text_command(&commit_args)?;
+
+    let sha_args = vec![
+        "-C".to_string(),
+        worktree_dir.display().to_string(),
+        "rev-parse".to_string(),
+        "HEAD".to_string(),
+    ];
+    let commit_sha = run_git_text_command(&sha_args)?;
+
+    Ok(QuickFixCommitMetadata {
+        branch_name: branch_name.to_string(),
+        commit_url: quick_fix_commit_url(repo, &commit_sha),
+        commit_sha,
+    })
+}
+
+fn current_git_head_sha() -> anyhow::Result<String> {
+    let args = vec!["rev-parse".to_string(), "HEAD".to_string()];
+    run_git_text_command(&args)
+}
+
+fn git_has_staged_changes(worktree_dir: &std::path::Path) -> anyhow::Result<bool> {
+    let worktree = worktree_dir.display().to_string();
+    let output = std::process::Command::new("git")
+        .args(["-C", &worktree, "diff", "--cached", "--quiet"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "git is not available in PATH. Install git before running process quick-fix actions."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `git`: {err}")
+            }
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let details = if !stderr.is_empty() { stderr } else { stdout };
+            anyhow::bail!("`git diff --cached --quiet` failed: {}", details);
+        }
+    }
+}
+
+fn run_git_text_command(args: &[String]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!("git is not available in PATH.")
+            } else {
+                anyhow::anyhow!("Failed to start `git`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`git {}` failed with status {}: {}",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("`git` returned non-UTF8 output")?;
+    Ok(stdout.trim().to_string())
+}
+
+fn quick_fix_commit_message(pr: u64, comment_id: &str) -> String {
+    format!("process: quick fix for PR #{pr} comment {comment_id}")
+}
+
+fn quick_fix_commit_url(repo: &str, sha: &str) -> String {
+    format!("https://github.com/{repo}/commit/{sha}")
+}
+
+fn quick_fix_branch_name(pr: u64, comment_id: &str) -> String {
+    let short = short_comment_id_for_branch(comment_id);
+    format!("process/quick-fix-pr-{pr}-{short}")
+}
+
+fn quick_fix_worktree_dir_name(branch_name: &str) -> String {
+    branch_name.replace('/', "__")
+}
+
+fn short_comment_id_for_branch(comment_id: &str) -> String {
+    let mut short = String::new();
+    let mut last_was_dash = false;
+    for ch in comment_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            short.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !short.is_empty() {
+            short.push('-');
+            last_was_dash = true;
+        }
+        if short.len() >= 24 {
+            break;
+        }
+    }
+    while short.ends_with('-') {
+        short.pop();
+    }
+    if short.is_empty() {
+        return "comment".to_string();
+    }
+    short
 }
 
 fn build_quick_fix_prompt(repo: &str, pr: u64, item: &ProcessCommentTriageItem) -> String {
@@ -1975,10 +2284,23 @@ fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
         if let Some(verification) = &item.verification {
             line.push_str(&format!("; verification: {verification}"));
         }
+        if let (Some(commit_sha), Some(commit_url)) = (&item.commit_sha, &item.commit_url) {
+            line.push_str(&format!(
+                "; commit: [`{}`]({commit_url})",
+                short_commit_sha(commit_sha)
+            ));
+        }
         body.push_str(&line);
         body.push('\n');
     }
     body
+}
+
+fn short_commit_sha(sha: &str) -> &str {
+    if sha.len() > 12 {
+        return &sha[..12];
+    }
+    sha
 }
 
 fn extract_first_url(text: &str) -> Option<String> {
@@ -3082,12 +3404,37 @@ mod tests {
             summary: "Applied minimal fix".to_string(),
             files: vec!["codex-rs/cli/src/main.rs".to_string()],
             verification: Some("not run".to_string()),
+            commit_sha: Some("0123456789abcdef".to_string()),
+            commit_url: Some(
+                "https://github.com/openai/codex-process/commit/0123456789abcdef".to_string(),
+            ),
         }]);
         assert_eq!(
             body,
-            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run\n"
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef)\n"
                 .to_string()
         );
+    }
+
+    #[test]
+    fn quick_fix_branch_name_is_deterministic_and_safe() {
+        let branch = quick_fix_branch_name(123, "PRRC_ABC/123");
+        assert_eq!(branch, "process/quick-fix-pr-123-prrc-abc-123".to_string());
+    }
+
+    #[test]
+    fn quick_fix_commit_url_uses_repo_and_sha() {
+        let url = quick_fix_commit_url("openai/codex-process", "abc123");
+        assert_eq!(
+            url,
+            "https://github.com/openai/codex-process/commit/abc123".to_string()
+        );
+    }
+
+    #[test]
+    fn short_commit_sha_truncates_long_values() {
+        assert_eq!(short_commit_sha("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_commit_sha("abc123"), "abc123");
     }
 
     #[test]

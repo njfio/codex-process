@@ -65,8 +65,8 @@ codex process issues watch --repo owner/repo --label process:auto-fix --limit 20
 The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
 The `pr-comments` subcommand performs live GitHub comment ingestion via `gh`, capturing unresolved PR review comments and issue comments into `.process/runs/<run-id>/pr-comments.json`.
 Passing `--act` enables triage and follow-up automation: comments are classified (`quick_fix`, `needs_issue`, `question`) and written to `.process/runs/<run-id>/triage.json`.
-For `quick_fix` items, Codex now runs targeted `exec` subprocesses to apply minimal fixes and records per-item execution results (attempted/success/summary/error).
-When at least one quick fix succeeds, the command posts one concise PR update comment through `gh pr comment` summarizing applied items (including files/verification status when available), and stores that comment URL in the triage artifact when it can be detected.
+For `quick_fix` items, Codex now runs targeted `exec` subprocesses in isolated git worktrees/branches (`process/quick-fix-pr-<pr>-<comment-id-short>`), creates one commit per successful item, and records per-item execution + commit metadata in the triage artifact (`quickFixBranch`, `quickFixCommitSha`, `quickFixCommitUrl`).
+When at least one quick fix succeeds, the command posts one concise PR update comment through `gh pr comment` summarizing applied items (including files/verification status and commit links when available), and stores that comment URL in the triage artifact when it can be detected.
 For `needs_issue` items, follow-up issues are opened via `gh issue create` and linked in the artifact.
 The `issues watch` subcommand fetches matching open issues and writes `.process/runs/<run-id>/issues-watch.json` with `fetchedAt`, `repo`, `label`, `openIssues[]`, and `suggestedActions[]`.
 
