@@ -52,23 +52,24 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 
 ## Process Mode (fork-specific, experimental)
 
-This fork adds an experimental `process` command group to bootstrap process-native runs:
+This fork now ships a renamed primary CLI binary: **`nickdex`**.
+(`codex` remains as a compatibility alias for now.)
 
 ```shell
-codex process run --task "Implement X"
-codex process status --run-id <id>
-codex process pr-comments --repo owner/repo --pr 123
-codex process pr-comments --repo owner/repo --pr 123 --act
-codex process pr-comments --repo owner/repo --pr 123 --act --dry-run
-codex process pr-comments --repo owner/repo --pr 123 --act --no-dedupe
-codex process pr-comments --repo owner/repo --pr 123 --act --require-clean-worktree --max-mutations-per-run 12
-codex process pr-comments --repo owner/repo --pr 123 --gh-max-attempts 7 --gh-base-backoff-ms 750
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --dry-run
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --no-dedupe
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --confirm-label process:auto-fix --max-mutations-per-run 12
-codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --max-concurrency 3 --queue-delay-ms 400 --max-act-items 10
+nickdex process run --task "Implement X"
+nickdex process status --run-id <id>
+nickdex process pr-comments --repo owner/repo --pr 123
+nickdex process pr-comments --repo owner/repo --pr 123 --act
+nickdex process pr-comments --repo owner/repo --pr 123 --act --dry-run
+nickdex process pr-comments --repo owner/repo --pr 123 --act --no-dedupe
+nickdex process pr-comments --repo owner/repo --pr 123 --act --require-clean-worktree --max-mutations-per-run 12
+nickdex process pr-comments --repo owner/repo --pr 123 --gh-max-attempts 7 --gh-base-backoff-ms 750
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --dry-run
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --no-dedupe
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --confirm-label process:auto-fix --max-mutations-per-run 12
+nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --max-concurrency 3 --queue-delay-ms 400 --max-act-items 10
 ```
 
 The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
