@@ -255,7 +255,7 @@ async fn turn_start_notify_payload_includes_initialize_client_name() -> Result<(
     )
     .await??;
 
-    let notify_file = Path::new(notify_file);
+    let notify_file = Path::new(&notify_file);
     fs_wait::wait_for_path_exists(notify_file, Duration::from_secs(5)).await?;
     let payload_raw = tokio::fs::read_to_string(notify_file).await?;
     let payload: Value = serde_json::from_str(&payload_raw)?;
