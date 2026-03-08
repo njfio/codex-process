@@ -477,6 +477,12 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn connection_initialized(&self, connection_id: ConnectionId) {
+        self.codex_message_processor
+            .connection_initialized(connection_id)
+            .await;
+    }
+
     pub(crate) async fn try_attach_thread_listener(
         &mut self,
         thread_id: ThreadId,
