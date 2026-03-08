@@ -34,6 +34,7 @@ use owo_colors::OwoColorize;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use supports_color::Stream;
 
 #[cfg(target_os = "macos")]
@@ -546,9 +547,44 @@ struct FeatureSetArgs {
 
 #[derive(Debug, Parser)]
 struct ProcessCli {
+    #[command(flatten)]
+    gh_retry: ProcessGhRetryArgs,
+
     #[command(subcommand)]
     sub: ProcessSubcommand,
 }
+
+const DEFAULT_PROCESS_GH_MAX_ATTEMPTS: u32 = 5;
+const DEFAULT_PROCESS_GH_BASE_BACKOFF_MS: u64 = 500;
+const MAX_PROCESS_GH_BACKOFF_MS: u64 = 10_000;
+
+#[derive(Debug, Args, Clone, Copy)]
+struct ProcessGhRetryArgs {
+    /// Maximum `gh` command attempts for transient/rate-limit failures.
+    #[arg(long, global = true, default_value_t = DEFAULT_PROCESS_GH_MAX_ATTEMPTS, value_parser = clap::value_parser!(u32).range(1..=10))]
+    gh_max_attempts: u32,
+
+    /// Base backoff in milliseconds for `gh` retries (exponential + jitter).
+    #[arg(long, global = true, default_value_t = DEFAULT_PROCESS_GH_BASE_BACKOFF_MS, value_parser = clap::value_parser!(u64).range(50..=60_000))]
+    gh_base_backoff_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GhRetryConfig {
+    max_attempts: u32,
+    base_backoff_ms: u64,
+}
+
+impl Default for GhRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_PROCESS_GH_MAX_ATTEMPTS,
+            base_backoff_ms: DEFAULT_PROCESS_GH_BASE_BACKOFF_MS,
+        }
+    }
+}
+
+static PROCESS_GH_RETRY_CONFIG: OnceLock<GhRetryConfig> = OnceLock::new();
 
 #[derive(Debug, clap::Subcommand)]
 enum ProcessSubcommand {
@@ -865,22 +901,25 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
         }
-        Some(Subcommand::Process(ProcessCli { sub })) => match sub {
-            ProcessSubcommand::Run(args) => {
-                run_process_mode(args)?;
-            }
-            ProcessSubcommand::Status(args) => {
-                process_mode_status(args)?;
-            }
-            ProcessSubcommand::PrComments(args) => {
-                process_mode_pr_comments(args)?;
-            }
-            ProcessSubcommand::Issues(ProcessIssuesCli { sub }) => match sub {
-                ProcessIssuesSubcommand::Watch(args) => {
-                    process_mode_issues_watch(args)?;
+        Some(Subcommand::Process(ProcessCli { gh_retry, sub })) => {
+            init_process_gh_retry_config(gh_retry);
+            match sub {
+                ProcessSubcommand::Run(args) => {
+                    run_process_mode(args)?;
                 }
-            },
-        },
+                ProcessSubcommand::Status(args) => {
+                    process_mode_status(args)?;
+                }
+                ProcessSubcommand::PrComments(args) => {
+                    process_mode_pr_comments(args)?;
+                }
+                ProcessSubcommand::Issues(ProcessIssuesCli { sub }) => match sub {
+                    ProcessIssuesSubcommand::Watch(args) => {
+                        process_mode_issues_watch(args)?;
+                    }
+                },
+            }
+        }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 // Respect root-level `-c` overrides plus top-level flags like `--profile`.
@@ -2126,73 +2165,154 @@ fn resolve_review_thread(thread_id: &str) -> anyhow::Result<()> {
     parse_resolve_review_thread_response(response)
 }
 
-fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
-    let output = std::process::Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
-                )
-            } else {
-                anyhow::anyhow!("Failed to start `gh`: {err}")
-            }
-        })?;
+fn init_process_gh_retry_config(args: ProcessGhRetryArgs) {
+    PROCESS_GH_RETRY_CONFIG.get_or_init(|| GhRetryConfig {
+        max_attempts: args.gh_max_attempts,
+        base_backoff_ms: args.gh_base_backoff_ms,
+    });
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let details = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "no output captured".to_string()
-        };
+fn gh_retry_config() -> GhRetryConfig {
+    PROCESS_GH_RETRY_CONFIG.get().copied().unwrap_or_default()
+}
+
+fn run_gh_command_with_retry(args: &[String]) -> anyhow::Result<std::process::Output> {
+    let config = gh_retry_config();
+    let summarized_args = summarize_gh_args(args);
+    let command_summary = format!("gh {summarized_args}");
+    let mut attempt_summaries = Vec::new();
+
+    for attempt in 1..=config.max_attempts {
+        let output = std::process::Command::new("gh")
+            .args(args)
+            .output()
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
+                    )
+                } else {
+                    anyhow::anyhow!("Failed to start `gh`: {err}")
+                }
+            })?;
+
+        if output.status.success() {
+            return Ok(output);
+        }
+
+        let details = gh_failure_details(&output);
+        let status_code = output.status.code();
+        let retryable = is_transient_gh_failure(status_code, &details);
+        let status = output.status;
+        attempt_summaries.push(format!(
+            "attempt {attempt}/{max_attempts} failed with status {status}: {details}",
+            max_attempts = config.max_attempts
+        ));
+
+        if retryable && attempt < config.max_attempts {
+            let backoff_ms =
+                gh_retry_backoff_ms(config.base_backoff_ms, attempt, gh_retry_jitter_seed());
+            eprintln!(
+                "warning: {command_summary} hit a transient GitHub failure ({details}); retrying attempt {next}/{max_attempts} in {backoff_ms}ms",
+                next = attempt + 1,
+                max_attempts = config.max_attempts
+            );
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            continue;
+        }
+
+        if retryable {
+            anyhow::bail!(
+                "{command_summary} failed after {attempts} attempts due to transient GitHub failures.\n{}\nCheck `gh auth status`; if rate-limited, wait and retry with `--gh-max-attempts` / `--gh-base-backoff-ms`.",
+                attempt_summaries.join("\n"),
+                attempts = config.max_attempts
+            );
+        }
+
         anyhow::bail!(
-            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo/PR access.",
-            args.join(" "),
-            output.status,
-            details
+            "{command_summary} failed with a non-retryable GitHub error after {attempt} attempt(s): {details}\nCheck `gh auth status` and verify repo access.",
         );
     }
 
+    anyhow::bail!("{command_summary} failed before executing any attempt.")
+}
+
+fn summarize_gh_args(args: &[String]) -> String {
+    const MAX_LEN: usize = 120;
+    let joined = args.join(" ");
+    if joined.len() <= MAX_LEN {
+        return joined;
+    }
+    let mut truncated = joined
+        .chars()
+        .take(MAX_LEN.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn gh_failure_details(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output captured".to_string()
+    }
+}
+
+fn is_transient_gh_failure(status_code: Option<i32>, details: &str) -> bool {
+    if matches!(status_code, Some(429 | 502 | 503 | 504)) {
+        return true;
+    }
+
+    let normalized = details.to_lowercase();
+    [
+        "http 429",
+        "too many requests",
+        "rate limit",
+        "secondary rate limit",
+        "try again later",
+        "abuse detection",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "econnreset",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn gh_retry_backoff_ms(base_backoff_ms: u64, attempt: u32, jitter_seed: u64) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(10);
+    let scaled = base_backoff_ms.saturating_mul(1_u64 << exponent);
+    let capped = scaled.min(MAX_PROCESS_GH_BACKOFF_MS);
+    let jitter_window = capped / 4;
+    let jitter = if jitter_window == 0 {
+        0
+    } else {
+        jitter_seed % (jitter_window + 1)
+    };
+    capped.saturating_add(jitter)
+}
+
+fn gh_retry_jitter_seed() -> u64 {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_u64, |duration| duration.as_nanos() as u64);
+    now_nanos ^ u64::from(std::process::id())
+}
+
+fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
+    let output = run_gh_command_with_retry(args)?;
     serde_json::from_slice(&output.stdout).context("`gh` returned invalid JSON output")
 }
 
 fn run_gh_text_command(args: &[String]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
-                )
-            } else {
-                anyhow::anyhow!("Failed to start `gh`: {err}")
-            }
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let details = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "no output captured".to_string()
-        };
-        anyhow::bail!(
-            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo access.",
-            args.join(" "),
-            output.status,
-            details
-        );
-    }
-
+    let output = run_gh_command_with_retry(args)?;
     let stdout = String::from_utf8(output.stdout).context("`gh` returned non-UTF8 output")?;
     Ok(stdout.trim().to_string())
 }
@@ -4216,7 +4336,7 @@ mod tests {
             "Implement process mode",
         ])
         .expect("parse should succeed");
-        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
         let ProcessSubcommand::Run(ProcessRunArgs { task }) = sub else {
@@ -4231,18 +4351,24 @@ mod tests {
             "codex",
             "process",
             "pr-comments",
+            "--gh-max-attempts",
+            "7",
+            "--gh-base-backoff-ms",
+            "750",
             "--repo",
             "njfio/codex-process",
             "--pr",
             "1",
         ])
         .expect("parse should succeed");
-        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+        let Some(Subcommand::Process(ProcessCli { gh_retry, sub })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
         let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr, act }) = sub else {
             panic!("expected process pr-comments");
         };
+        assert_eq!(gh_retry.gh_max_attempts, 7);
+        assert_eq!(gh_retry.gh_base_backoff_ms, 750);
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(pr, 1);
         assert!(!act);
@@ -4261,7 +4387,7 @@ mod tests {
             "--act",
         ])
         .expect("parse should succeed");
-        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
         let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { act, .. }) = sub else {
@@ -4285,7 +4411,7 @@ mod tests {
             "20",
         ])
         .expect("parse should succeed");
-        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
         let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
@@ -4319,7 +4445,7 @@ mod tests {
             "--act",
         ])
         .expect("parse should succeed");
-        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
         let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
@@ -4844,6 +4970,51 @@ mod tests {
     fn short_commit_sha_truncates_long_values() {
         assert_eq!(short_commit_sha("0123456789abcdef"), "0123456789ab");
         assert_eq!(short_commit_sha("abc123"), "abc123");
+    }
+
+    #[test]
+    fn is_transient_gh_failure_matches_status_and_rate_limit_signals() {
+        assert!(is_transient_gh_failure(
+            Some(429),
+            "HTTP 429 Too Many Requests",
+        ));
+        assert!(is_transient_gh_failure(
+            Some(1),
+            "You have exceeded a secondary rate limit. Please try again later.",
+        ));
+        assert!(is_transient_gh_failure(
+            Some(1),
+            "Request failed due to abuse detection mechanisms.",
+        ));
+        assert!(!is_transient_gh_failure(
+            Some(1),
+            "GraphQL: Resource not accessible by integration",
+        ));
+    }
+
+    #[test]
+    fn gh_retry_backoff_ms_grows_exponentially_and_caps_with_jitter() {
+        assert_eq!(gh_retry_backoff_ms(500, 1, 0), 500);
+        assert_eq!(gh_retry_backoff_ms(500, 2, 0), 1000);
+        assert_eq!(gh_retry_backoff_ms(500, 3, 0), 2000);
+
+        let capped = gh_retry_backoff_ms(500, 8, 9_999_999);
+        assert!(capped >= MAX_PROCESS_GH_BACKOFF_MS);
+        assert!(capped <= MAX_PROCESS_GH_BACKOFF_MS + (MAX_PROCESS_GH_BACKOFF_MS / 4));
+    }
+
+    #[test]
+    fn summarize_gh_args_truncates_long_graphql_payloads() {
+        let query = "a".repeat(300);
+        let args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+        ];
+        let summary = summarize_gh_args(&args);
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 120);
     }
 
     #[test]
