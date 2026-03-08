@@ -275,7 +275,7 @@ impl WatchdogManager {
 
                 if let Some(message) = fallback_message {
                     if let Err(err) = control_for_spawn
-                        .send_agent_message(snapshot.owner_thread_id, helper_id, message)
+                        .send_watchdog_wakeup(snapshot.owner_thread_id, helper_id, message)
                         .await
                     {
                         warn!(

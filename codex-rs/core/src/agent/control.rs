@@ -486,22 +486,6 @@ impl AgentControl {
         result
     }
 
-<<<<<<< HEAD
-    pub(crate) async fn send_prompt(
-        &self,
-        agent_id: ThreadId,
-        prompt: String,
-    ) -> CodexResult<String> {
-        self.send_input(
-            agent_id,
-            vec![UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-        )
-        .await
-    }
-
     /// Deliver inbox input to an existing agent thread.
     ///
     /// Watchdog helpers rely on this as the mandatory fallback wake-up path when
@@ -522,20 +506,35 @@ impl AgentControl {
             return self.send_prompt(agent_id, message).await;
         }
 
-        let prepend_turn_start_user_message =
-            { !thread.codex.session.active_turn.lock().await.is_some() };
-        let result = state
-            .send_op(
-                agent_id,
-                Op::InjectResponseItems {
-                    items: build_agent_inbox_items(
-                        sender_thread_id,
-                        message,
-                        prepend_turn_start_user_message,
-                    )?,
-                },
-            )
-            .await;
+        let result =
+            inject_agent_message(&state, &thread, agent_id, sender_thread_id, message).await;
+        if matches!(result, Err(CodexErr::InternalAgentDied)) {
+            let _ = state.remove_thread(&agent_id).await;
+            self.guards.release_spawned_thread(agent_id);
+        }
+        result
+    }
+
+    /// Deliver watchdog wake-up input to an owner thread.
+    ///
+    /// This intentionally bypasses `agent_use_function_call_inbox` for
+    /// non-subagent owners. Watchdog check-ins must wake the owner exactly
+    /// once; the injected inbox path reliably starts or resumes the owner's
+    /// next turn while preserving helper identity in history.
+    pub(crate) async fn send_watchdog_wakeup(
+        &self,
+        agent_id: ThreadId,
+        sender_thread_id: ThreadId,
+        message: String,
+    ) -> CodexResult<String> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        let snapshot = thread.config_snapshot().await;
+        let result = if matches!(snapshot.session_source, SessionSource::SubAgent(_)) {
+            self.send_prompt(agent_id, message).await
+        } else {
+            inject_agent_message(&state, &thread, agent_id, sender_thread_id, message).await
+        };
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
             let _ = state.remove_thread(&agent_id).await;
             self.guards.release_spawned_thread(agent_id);
@@ -1060,6 +1059,28 @@ fn build_agent_inbox_items(
     Ok(items)
 }
 
+async fn inject_agent_message(
+    state: &ThreadManagerState,
+    thread: &Arc<crate::CodexThread>,
+    agent_id: ThreadId,
+    sender_thread_id: ThreadId,
+    message: String,
+) -> CodexResult<String> {
+    let prepend_turn_start_user_message = !thread.codex.session.active_turn.lock().await.is_some();
+    state
+        .send_op(
+            agent_id,
+            Op::InjectResponseItems {
+                items: build_agent_inbox_items(
+                    sender_thread_id,
+                    message,
+                    prepend_turn_start_user_message,
+                )?,
+            },
+        )
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1318,6 +1339,51 @@ mod tests {
             }
             other => panic!("expected function call item, got {other:?}"),
         }
+        match &items[2] {
+            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                let output_text = output
+                    .body
+                    .to_text()
+                    .expect("payload should convert to text");
+                let payload: AgentInboxPayload =
+                    serde_json::from_str(&output_text).expect("payload should be valid json");
+                assert_eq!(payload.sender_thread_id, sender_thread_id);
+                assert_eq!(payload.message, "watchdog update");
+            }
+            other => panic!("expected function call output item, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_watchdog_wakeup_to_root_thread_injects_response_items_by_default() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, _thread) = harness.start_thread().await;
+        let sender_thread_id = ThreadId::new();
+
+        let submission_id = harness
+            .control
+            .send_watchdog_wakeup(
+                receiver_thread_id,
+                sender_thread_id,
+                "watchdog update".to_string(),
+            )
+            .await
+            .expect("send_watchdog_wakeup should succeed");
+        assert!(!submission_id.is_empty());
+
+        let captured = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .find(|(thread_id, op)| {
+                *thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            })
+            .expect("expected injected watchdog wake-up op");
+
+        let Op::InjectResponseItems { items } = captured.1 else {
+            unreachable!("matched above");
+        };
+        assert_eq!(items.len(), 3);
         match &items[2] {
             ResponseInputItem::FunctionCallOutput { output, .. } => {
                 let output_text = output
@@ -2631,14 +2697,22 @@ mod tests {
         .expect("helper should reach shutdown");
         harness.control.run_watchdogs_once_for_tests().await;
 
-        let history = owner_thread.codex.session.clone_history().await;
-        let payload = history.raw_items().iter().find_map(|item| match item {
-            ResponseItem::FunctionCallOutput { output, .. } => output
-                .text_content()
-                .and_then(|text| serde_json::from_str::<AgentInboxPayload>(text).ok()),
-            _ => None,
-        });
-        let payload = payload.expect("owner should receive fallback agent inbox payload");
+        let payload = timeout(Duration::from_secs(2), async {
+            loop {
+                let history = owner_thread.codex.session.clone_history().await;
+                if let Some(payload) = history.raw_items().iter().find_map(|item| match item {
+                    ResponseItem::FunctionCallOutput { output, .. } => output
+                        .text_content()
+                        .and_then(|text| serde_json::from_str::<AgentInboxPayload>(text).ok()),
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner should receive fallback agent inbox payload");
         assert_eq!(payload.sender_thread_id, helper_thread_id);
         assert!(
             payload.message.starts_with("Watchdog check-in "),
