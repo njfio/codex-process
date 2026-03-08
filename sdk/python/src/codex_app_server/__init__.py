@@ -31,6 +31,11 @@ from .public_api import (
     TurnResult,
 )
 from .public_types import (
+    TurnAskForApproval,
+    TurnPersonality,
+    TurnReasoningEffort,
+    TurnReasoningSummary,
+    TurnSandboxPolicy,
     ThreadForkParams,
     ThreadListParams,
     ThreadResumeParams,
@@ -63,6 +68,11 @@ __all__ = [
     "ThreadResumeParams",
     "ThreadListParams",
     "ThreadForkParams",
+    "TurnAskForApproval",
+    "TurnReasoningEffort",
+    "TurnPersonality",
+    "TurnSandboxPolicy",
+    "TurnReasoningSummary",
     "TurnStartParams",
     "retry_on_overload",
     "AppServerError",

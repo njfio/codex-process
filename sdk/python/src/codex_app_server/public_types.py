@@ -14,6 +14,11 @@ from .generated.v2_all.ThreadResumeParams import SandboxMode as ResumeSandboxMod
 from .generated.v2_all.ThreadResumeParams import ThreadResumeParams
 from .generated.v2_all.ThreadStartParams import AskForApproval, Personality, SandboxMode, ThreadStartParams
 from .generated.v2_all.TurnCompletedNotification import TurnStatus
+from .generated.v2_all.TurnStartParams import AskForApproval as TurnAskForApproval
+from .generated.v2_all.TurnStartParams import Personality as TurnPersonality
+from .generated.v2_all.TurnStartParams import ReasoningEffort as TurnReasoningEffort
+from .generated.v2_all.TurnStartParams import ReasoningSummary as TurnReasoningSummary
+from .generated.v2_all.TurnStartParams import SandboxPolicy as TurnSandboxPolicy
 from .generated.v2_all.TurnStartParams import TurnStartParams
 from .generated.v2_all.TurnSteerParams import TurnSteerParams
 
@@ -32,6 +37,11 @@ __all__ = [
     "ForkAskForApproval",
     "ForkSandboxMode",
     "ThreadForkParams",
+    "TurnAskForApproval",
+    "TurnReasoningEffort",
+    "TurnPersonality",
+    "TurnSandboxPolicy",
+    "TurnReasoningSummary",
     "TurnStartParams",
     "TurnSteerParams",
     "TurnStatus",

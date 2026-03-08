@@ -22,11 +22,6 @@ from codex_app_server import (
     SkillInput,
     MentionInput,
     ThreadItem,
-    ThreadStartParams,
-    ThreadResumeParams,
-    ThreadListParams,
-    ThreadForkParams,
-    TurnStartParams,
 )
 ```
 
@@ -43,9 +38,9 @@ Properties/methods:
 
 - `metadata -> InitializeResult`
 - `close() -> None`
-- `thread_start(params: ThreadStartParams) -> Thread`
+- `thread_start(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, ephemeral=None, model=None, modelProvider=None, personality=None, sandbox=None) -> Thread`
 - `thread(thread_id: str) -> Thread`
-- `thread_list(params: ThreadListParams | None = None) -> ThreadListResponse`
+- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, modelProviders=None, sortKey=None, sourceKinds=None) -> ThreadListResponse`
 - `models(*, include_hidden: bool = False) -> ModelListResponse`
 
 Context manager:
@@ -65,9 +60,9 @@ Properties/methods:
 
 - `metadata -> InitializeResult`
 - `close() -> Awaitable[None]`
-- `thread_start(params: ThreadStartParams) -> Awaitable[AsyncThread]`
+- `thread_start(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, ephemeral=None, model=None, modelProvider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
 - `thread(thread_id: str) -> AsyncThread`
-- `thread_list(params: ThreadListParams | None = None) -> Awaitable[ThreadListResponse]`
+- `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, modelProviders=None, sortKey=None, sourceKinds=None) -> Awaitable[ThreadListResponse]`
 - `models(*, include_hidden: bool = False) -> Awaitable[ModelListResponse]`
 
 Async context manager:
@@ -83,10 +78,10 @@ async with AsyncCodex() as codex:
 
 ### Thread
 
-- `turn(input: Input, *, params: TurnStartParams | dict[str, object] | None = None) -> Turn`
-- `resume(params: ThreadResumeParams) -> Thread`
+- `turn(input: Input, *, approvalPolicy=None, cwd=None, effort=None, model=None, outputSchema=None, personality=None, sandboxPolicy=None, summary=None) -> Turn`
+- `resume(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, model=None, modelProvider=None, personality=None, sandbox=None) -> Thread`
 - `read(*, include_turns: bool = False) -> ThreadReadResponse`
-- `fork(params: ThreadForkParams) -> Thread`
+- `fork(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, model=None, modelProvider=None, sandbox=None) -> Thread`
 - `archive() -> ThreadArchiveResponse`
 - `unarchive() -> Thread`
 - `set_name(name: str) -> ThreadSetNameResponse`
@@ -94,10 +89,10 @@ async with AsyncCodex() as codex:
 
 ### AsyncThread
 
-- `turn(input: Input, *, params: TurnStartParams | dict[str, object] | None = None) -> Awaitable[AsyncTurn]`
-- `resume(params: ThreadResumeParams) -> Awaitable[AsyncThread]`
+- `turn(input: Input, *, approvalPolicy=None, cwd=None, effort=None, model=None, outputSchema=None, personality=None, sandboxPolicy=None, summary=None) -> Awaitable[AsyncTurn]`
+- `resume(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, model=None, modelProvider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
 - `read(*, include_turns: bool = False) -> Awaitable[ThreadReadResponse]`
-- `fork(params: ThreadForkParams) -> Awaitable[AsyncThread]`
+- `fork(*, approvalPolicy=None, baseInstructions=None, config=None, cwd=None, developerInstructions=None, model=None, modelProvider=None, sandbox=None) -> Awaitable[AsyncThread]`
 - `archive() -> Awaitable[ThreadArchiveResponse]`
 - `unarchive() -> Awaitable[AsyncThread]`
 - `set_name(name: str) -> Awaitable[ThreadSetNameResponse]`
@@ -165,10 +160,10 @@ from codex_app_server import (
 ## Example
 
 ```python
-from codex_app_server import Codex, TextInput, ThreadStartParams
+from codex_app_server import Codex, TextInput
 
 with Codex() as codex:
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
     result = thread.turn(TextInput("Say hello in one sentence.")).run()
     print(result.text)
 ```

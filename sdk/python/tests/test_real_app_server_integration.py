@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_app_server import Codex, TextInput, ThreadStartParams
+from codex_app_server import Codex, TextInput
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_REAL_CODEX_TESTS") != "1" or shutil.which("codex") is None,
@@ -81,7 +81,7 @@ def test_real_initialize_and_model_list():
 
 def test_real_thread_and_turn_start_smoke():
     with Codex() as codex:
-        thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
         result = thread.turn(TextInput("hello")).run()
 
         assert isinstance(result.thread_id, str) and result.thread_id
@@ -90,7 +90,7 @@ def test_real_thread_and_turn_start_smoke():
 
 def test_real_streaming_smoke_turn_completed():
     with Codex() as codex:
-        thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
         turn = thread.turn(TextInput("Reply with one short sentence."))
 
         saw_delta = False
@@ -109,7 +109,7 @@ def test_real_streaming_smoke_turn_completed():
 
 def test_real_turn_interrupt_smoke():
     with Codex() as codex:
-        thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
         turn = thread.turn(TextInput("Count from 1 to 200 with commas."))
 
         # Best effort: interrupting quickly may race with completion on fast models.

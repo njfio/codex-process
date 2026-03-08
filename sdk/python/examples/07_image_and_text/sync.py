@@ -1,7 +1,7 @@
-from codex_app_server import ThreadStartParams, Codex, ImageInput, TextInput
+from codex_app_server import Codex, ImageInput, TextInput
 
 with Codex() as codex:
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
 
     result = thread.turn(
         [

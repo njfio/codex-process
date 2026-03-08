@@ -12,10 +12,10 @@ python -m pip install -e .
 ## Quickstart (sync)
 
 ```python
-from codex_app_server import Codex, TextInput, ThreadStartParams
+from codex_app_server import Codex, TextInput
 
 with Codex() as codex:
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
     result = thread.turn(TextInput("Say hello in one sentence.")).run()
     print(result.text)
 ```
@@ -24,12 +24,12 @@ with Codex() as codex:
 
 ```python
 import asyncio
-from codex_app_server import AsyncCodex, TextInput, ThreadStartParams
+from codex_app_server import AsyncCodex, TextInput
 
 
 async def main() -> None:
     async with AsyncCodex() as codex:
-        thread = await codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = await codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
         turn = await thread.turn(TextInput("Say hello in one sentence."))
         result = await turn.run()
         print(result.text)

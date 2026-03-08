@@ -1,7 +1,7 @@
 from base64 import b64decode
 from pathlib import Path
 
-from codex_app_server import ThreadStartParams, Codex, LocalImageInput, TextInput
+from codex_app_server import Codex, LocalImageInput, TextInput
 
 HERE = Path(__file__).parent
 IMAGE_PATH = HERE / "sample.png"
@@ -15,7 +15,7 @@ if not IMAGE_PATH.exists():
     )
 
 with Codex() as codex:
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
 
     result = thread.turn(
         [

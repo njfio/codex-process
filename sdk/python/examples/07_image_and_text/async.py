@@ -1,11 +1,11 @@
 import asyncio
 
-from codex_app_server import AsyncCodex, ImageInput, TextInput, ThreadStartParams
+from codex_app_server import AsyncCodex, ImageInput, TextInput
 
 
 async def main() -> None:
     async with AsyncCodex() as codex:
-        thread = await codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = await codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
 
         turn = await thread.turn(
             [

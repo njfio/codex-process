@@ -20,12 +20,12 @@ Requirements:
 ## 2) Run your first turn (sync)
 
 ```python
-from codex_app_server import Codex, TextInput, ThreadStartParams
+from codex_app_server import Codex, TextInput
 
 with Codex() as codex:
     print("Server:", codex.metadata.server_name, codex.metadata.server_version)
 
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
     result = thread.turn(TextInput("Say hello in one sentence.")).run()
 
     print("Thread:", result.thread_id)
@@ -43,10 +43,10 @@ What happened:
 ## 3) Continue the same thread (multi-turn)
 
 ```python
-from codex_app_server import Codex, TextInput, ThreadStartParams
+from codex_app_server import Codex, TextInput
 
 with Codex() as codex:
-    thread = codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+    thread = codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
 
     first = thread.turn(TextInput("Summarize Rust ownership in 2 bullets.")).run()
     second = thread.turn(TextInput("Now explain it to a Python developer.")).run()
@@ -59,12 +59,12 @@ with Codex() as codex:
 
 ```python
 import asyncio
-from codex_app_server import AsyncCodex, TextInput, ThreadStartParams
+from codex_app_server import AsyncCodex, TextInput
 
 
 async def main() -> None:
     async with AsyncCodex() as codex:
-        thread = await codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = await codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
         turn = await thread.turn(TextInput("Continue where we left off."))
         result = await turn.run()
         print(result.text)

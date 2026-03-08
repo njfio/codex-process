@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 from .async_client import AsyncAppServerClient
 from .client import AppServerClient, AppServerConfig
@@ -22,6 +22,21 @@ from .generated.v2_types import (
 )
 from .models import InitializeResponse, JsonObject, Notification
 from .public_types import (
+    ForkAskForApproval,
+    ForkSandboxMode,
+    ResumeAskForApproval,
+    ResumePersonality,
+    ResumeSandboxMode,
+    ThreadSortKey,
+    ThreadSourceKind,
+    TurnAskForApproval,
+    TurnPersonality,
+    TurnReasoningEffort,
+    TurnReasoningSummary,
+    TurnSandboxPolicy,
+    AskForApproval,
+    Personality,
+    SandboxMode,
     ThreadForkParams,
     ThreadListParams,
     ThreadResumeParams,
@@ -130,15 +145,61 @@ class Codex:
     def close(self) -> None:
         self._client.close()
 
-    def thread_start(self, params: ThreadStartParams) -> Thread:
+    # BEGIN GENERATED: Codex.flat_methods
+    def thread_start(
+        self,
+        *,
+        approvalPolicy: AskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        ephemeral: bool | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        personality: Personality | None = None,
+        sandbox: SandboxMode | None = None,
+    ) -> Thread:
+        params = ThreadStartParams(
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            ephemeral=ephemeral,
+            model=model,
+            modelProvider=modelProvider,
+            personality=personality,
+            sandbox=sandbox,
+        )
         started = self._client.thread_start(params)
         return Thread(self._client, started.thread.id)
 
+    def thread_list(
+        self,
+        *,
+        archived: bool | None = None,
+        cursor: str | None = None,
+        cwd: str | None = None,
+        limit: int | None = None,
+        modelProviders: list[str] | None = None,
+        sortKey: ThreadSortKey | None = None,
+        sourceKinds: list[ThreadSourceKind] | None = None,
+    ) -> ThreadListResponse:
+        params = ThreadListParams(
+            archived=archived,
+            cursor=cursor,
+            cwd=cwd,
+            limit=limit,
+            modelProviders=modelProviders,
+            sortKey=sortKey,
+            sourceKinds=sourceKinds,
+        )
+        return self._client.thread_list(params)
+    # END GENERATED: Codex.flat_methods
+
     def thread(self, thread_id: str) -> Thread:
         return Thread(self._client, thread_id)
-
-    def thread_list(self, params: ThreadListParams | None = None) -> ThreadListResponse:
-        return self._client.thread_list(params)
 
     def models(self, *, include_hidden: bool = False) -> ModelListResponse:
         return self._client.model_list(include_hidden=include_hidden)
@@ -180,17 +241,63 @@ class AsyncCodex:
         self._init = None
         self._initialized = False
 
-    async def thread_start(self, params: ThreadStartParams) -> AsyncThread:
+    # BEGIN GENERATED: AsyncCodex.flat_methods
+    async def thread_start(
+        self,
+        *,
+        approvalPolicy: AskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        ephemeral: bool | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        personality: Personality | None = None,
+        sandbox: SandboxMode | None = None,
+    ) -> AsyncThread:
         await self._ensure_initialized()
+        params = ThreadStartParams(
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            ephemeral=ephemeral,
+            model=model,
+            modelProvider=modelProvider,
+            personality=personality,
+            sandbox=sandbox,
+        )
         started = await self._client.thread_start(params)
         return AsyncThread(self, started.thread.id)
 
+    async def thread_list(
+        self,
+        *,
+        archived: bool | None = None,
+        cursor: str | None = None,
+        cwd: str | None = None,
+        limit: int | None = None,
+        modelProviders: list[str] | None = None,
+        sortKey: ThreadSortKey | None = None,
+        sourceKinds: list[ThreadSourceKind] | None = None,
+    ) -> ThreadListResponse:
+        await self._ensure_initialized()
+        params = ThreadListParams(
+            archived=archived,
+            cursor=cursor,
+            cwd=cwd,
+            limit=limit,
+            modelProviders=modelProviders,
+            sortKey=sortKey,
+            sourceKinds=sourceKinds,
+        )
+        return await self._client.thread_list(params)
+    # END GENERATED: AsyncCodex.flat_methods
+
     def thread(self, thread_id: str) -> AsyncThread:
         return AsyncThread(self, thread_id)
-
-    async def thread_list(self, params: ThreadListParams | None = None) -> ThreadListResponse:
-        await self._ensure_initialized()
-        return await self._client.thread_list(params)
 
     async def models(self, *, include_hidden: bool = False) -> ModelListResponse:
         await self._ensure_initialized()
@@ -202,25 +309,93 @@ class Thread:
     _client: AppServerClient
     id: str
 
+    # BEGIN GENERATED: Thread.flat_methods
     def turn(
         self,
         input: Input,
         *,
-        params: TurnStartParams | JsonObject | None = None,
+        approvalPolicy: TurnAskForApproval | None = None,
+        cwd: str | None = None,
+        effort: TurnReasoningEffort | None = None,
+        model: str | None = None,
+        outputSchema: Any | None = None,
+        personality: TurnPersonality | None = None,
+        sandboxPolicy: TurnSandboxPolicy | None = None,
+        summary: TurnReasoningSummary | None = None,
     ) -> Turn:
-        turn = self._client.turn_start(self.id, _to_wire_input(input), params=params)
+        wire_input = _to_wire_input(input)
+        params = TurnStartParams(
+            threadId=self.id,
+            input=wire_input,
+            approvalPolicy=approvalPolicy,
+            cwd=cwd,
+            effort=effort,
+            model=model,
+            outputSchema=outputSchema,
+            personality=personality,
+            sandboxPolicy=sandboxPolicy,
+            summary=summary,
+        )
+        turn = self._client.turn_start(self.id, wire_input, params=params)
         return Turn(self._client, self.id, turn.turn.id)
 
-    def resume(self, params: ThreadResumeParams) -> Thread:
+    def resume(
+        self,
+        *,
+        approvalPolicy: ResumeAskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        personality: ResumePersonality | None = None,
+        sandbox: ResumeSandboxMode | None = None,
+    ) -> Thread:
+        params = ThreadResumeParams(
+            threadId=self.id,
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            model=model,
+            modelProvider=modelProvider,
+            personality=personality,
+            sandbox=sandbox,
+        )
         resumed = self._client.thread_resume(self.id, params)
         return Thread(self._client, resumed.thread.id)
 
-    def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
-        return self._client.thread_read(self.id, include_turns=include_turns)
-
-    def fork(self, params: ThreadForkParams) -> Thread:
+    def fork(
+        self,
+        *,
+        approvalPolicy: ForkAskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        sandbox: ForkSandboxMode | None = None,
+    ) -> Thread:
+        params = ThreadForkParams(
+            threadId=self.id,
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            model=model,
+            modelProvider=modelProvider,
+            sandbox=sandbox,
+        )
         forked = self._client.thread_fork(self.id, params)
         return Thread(self._client, forked.thread.id)
+    # END GENERATED: Thread.flat_methods
+
+    def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
+        return self._client.thread_read(self.id, include_turns=include_turns)
 
     def archive(self) -> ThreadArchiveResponse:
         return self._client.thread_archive(self.id)
@@ -241,33 +416,101 @@ class AsyncThread:
     _codex: AsyncCodex
     id: str
 
+    # BEGIN GENERATED: AsyncThread.flat_methods
     async def turn(
         self,
         input: Input,
         *,
-        params: TurnStartParams | JsonObject | None = None,
+        approvalPolicy: TurnAskForApproval | None = None,
+        cwd: str | None = None,
+        effort: TurnReasoningEffort | None = None,
+        model: str | None = None,
+        outputSchema: Any | None = None,
+        personality: TurnPersonality | None = None,
+        sandboxPolicy: TurnSandboxPolicy | None = None,
+        summary: TurnReasoningSummary | None = None,
     ) -> AsyncTurn:
         await self._codex._ensure_initialized()
+        wire_input = _to_wire_input(input)
+        params = TurnStartParams(
+            threadId=self.id,
+            input=wire_input,
+            approvalPolicy=approvalPolicy,
+            cwd=cwd,
+            effort=effort,
+            model=model,
+            outputSchema=outputSchema,
+            personality=personality,
+            sandboxPolicy=sandboxPolicy,
+            summary=summary,
+        )
         turn = await self._codex._client.turn_start(
             self.id,
-            _to_wire_input(input),
+            wire_input,
             params=params,
         )
         return AsyncTurn(self._codex, self.id, turn.turn.id)
 
-    async def resume(self, params: ThreadResumeParams) -> AsyncThread:
+    async def resume(
+        self,
+        *,
+        approvalPolicy: ResumeAskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        personality: ResumePersonality | None = None,
+        sandbox: ResumeSandboxMode | None = None,
+    ) -> AsyncThread:
         await self._codex._ensure_initialized()
+        params = ThreadResumeParams(
+            threadId=self.id,
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            model=model,
+            modelProvider=modelProvider,
+            personality=personality,
+            sandbox=sandbox,
+        )
         resumed = await self._codex._client.thread_resume(self.id, params)
         return AsyncThread(self._codex, resumed.thread.id)
+
+    async def fork(
+        self,
+        *,
+        approvalPolicy: ForkAskForApproval | None = None,
+        baseInstructions: str | None = None,
+        config: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        developerInstructions: str | None = None,
+        model: str | None = None,
+        modelProvider: str | None = None,
+        sandbox: ForkSandboxMode | None = None,
+    ) -> AsyncThread:
+        await self._codex._ensure_initialized()
+        params = ThreadForkParams(
+            threadId=self.id,
+            approvalPolicy=approvalPolicy,
+            baseInstructions=baseInstructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developerInstructions,
+            model=model,
+            modelProvider=modelProvider,
+            sandbox=sandbox,
+        )
+        forked = await self._codex._client.thread_fork(self.id, params)
+        return AsyncThread(self._codex, forked.thread.id)
+    # END GENERATED: AsyncThread.flat_methods
 
     async def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
         await self._codex._ensure_initialized()
         return await self._codex._client.thread_read(self.id, include_turns=include_turns)
-
-    async def fork(self, params: ThreadForkParams) -> AsyncThread:
-        await self._codex._ensure_initialized()
-        forked = await self._codex._client.thread_fork(self.id, params)
-        return AsyncThread(self._codex, forked.thread.id)
 
     async def archive(self) -> ThreadArchiveResponse:
         await self._codex._ensure_initialized()

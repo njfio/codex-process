@@ -2,7 +2,7 @@ import asyncio
 from base64 import b64decode
 from pathlib import Path
 
-from codex_app_server import AsyncCodex, LocalImageInput, TextInput, ThreadStartParams
+from codex_app_server import AsyncCodex, LocalImageInput, TextInput
 
 HERE = Path(__file__).parent
 IMAGE_PATH = HERE / "sample.png"
@@ -17,7 +17,7 @@ if not IMAGE_PATH.exists():
 
 async def main() -> None:
     async with AsyncCodex() as codex:
-        thread = await codex.thread_start(ThreadStartParams(model="gpt-5", config={"model_reasoning_effort": "high"}))
+        thread = await codex.thread_start(model="gpt-5", config={"model_reasoning_effort": "high"})
 
         turn = await thread.turn(
             [
