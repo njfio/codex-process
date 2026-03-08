@@ -644,6 +644,10 @@ struct ProcessPrCommentsArgs {
     /// Optional cap on mutating actions in one non-dry-run `--act` run.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100_000))]
     max_mutations_per_run: Option<u32>,
+
+    /// Bypass run-to-run dedupe checks in `--act` mode.
+    #[arg(long, default_value_t = false, requires = "act")]
+    no_dedupe: bool,
 }
 
 #[derive(Debug, Args)]
@@ -703,6 +707,10 @@ struct ProcessIssuesWatchArgs {
     /// Optional cap on number of issues acted on in one `--act` run.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     max_act_items: Option<u32>,
+
+    /// Bypass run-to-run dedupe checks in `--act` mode.
+    #[arg(long, default_value_t = false, requires = "act")]
+    no_dedupe: bool,
 }
 
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
@@ -1175,6 +1183,14 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         args.confirm_label.as_deref(),
         args.max_mutations_per_run,
     );
+    let operation_id = build_process_act_operation_id("pr-comments-act", &run_id);
+    let dedupe_index = if args.no_dedupe {
+        std::collections::HashSet::new()
+    } else {
+        build_pr_comments_dedupe_index(&run_id)
+    };
+    let mut dedupe_keys_matched = std::collections::BTreeSet::new();
+    let mut duplicate_count = 0usize;
     print_process_act_guardrail_summary(&guardrails);
     if guardrails.active && guardrails.require_clean_worktree {
         ensure_clean_git_worktree_for_mutations()?;
@@ -1194,6 +1210,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                 body: comment.body.clone(),
                 comment_url: comment.url.clone(),
                 decision,
+                dedupe_key: pr_comment_dedupe_key(&args.repo, args.pr, &comment.url, decision),
+                idempotent: false,
                 planned_action: format_pr_comments_planned_action(decision, None, args.dry_run),
                 skipped_reasons: Vec::new(),
                 created_issue_url: None,
@@ -1226,6 +1244,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             body: comment.body.clone(),
             comment_url: comment.url.clone(),
             decision,
+            dedupe_key: pr_comment_dedupe_key(&args.repo, args.pr, &comment.url, decision),
+            idempotent: false,
             planned_action: format_pr_comments_planned_action(decision, None, args.dry_run),
             skipped_reasons: Vec::new(),
             created_issue_url: None,
@@ -1283,8 +1303,22 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     };
     for item in &mut triage_items {
         match item.decision {
+            TriageDecision::QuickFix => grouped_by_decision.quick_fix += 1,
+            TriageDecision::NeedsIssue => grouped_by_decision.needs_issue += 1,
+            TriageDecision::Question => grouped_by_decision.question += 1,
+        }
+        if !args.no_dedupe && dedupe_index.contains(&item.dedupe_key) {
+            let reason = ProcessMutationSkipReason::DedupeMatched;
+            item.idempotent = true;
+            item.planned_action =
+                format_pr_comments_planned_action(item.decision, Some(reason), args.dry_run);
+            item.skipped_reasons.push(reason);
+            duplicate_count += 1;
+            dedupe_keys_matched.insert(item.dedupe_key.clone());
+            continue;
+        }
+        match item.decision {
             TriageDecision::QuickFix => {
-                grouped_by_decision.quick_fix += 1;
                 if args.dry_run {
                     continue;
                 }
@@ -1459,7 +1493,6 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                 }
             }
             TriageDecision::NeedsIssue => {
-                grouped_by_decision.needs_issue += 1;
                 if args.dry_run {
                     continue;
                 }
@@ -1490,9 +1523,7 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                     issue_url,
                 });
             }
-            TriageDecision::Question => {
-                grouped_by_decision.question += 1;
-            }
+            TriageDecision::Question => {}
         }
     }
     let pr_update_comment_url = if args.dry_run || successful_quick_fixes.is_empty() {
@@ -1511,11 +1542,14 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     };
 
     let triage_artifact = ProcessPrCommentsTriageArtifact {
+        operation_id,
         dry_run: args.dry_run,
         guardrails: guardrails.clone(),
         repo: args.repo.clone(),
         pr: args.pr,
         fetched_at: payload.fetched_at,
+        duplicate_count,
+        dedupe_keys_matched: dedupe_keys_matched.into_iter().collect(),
         triage_items,
         grouped_by_decision,
         created_issues: created_issues.clone(),
@@ -1596,7 +1630,7 @@ struct GroupedByType {
     total: usize,
 }
 
-#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum TriageDecision {
     QuickFix,
@@ -1614,6 +1648,8 @@ struct ProcessCommentTriageItem {
     body: String,
     comment_url: String,
     decision: TriageDecision,
+    dedupe_key: String,
+    idempotent: bool,
     planned_action: String,
     skipped_reasons: Vec<ProcessMutationSkipReason>,
     created_issue_url: Option<String>,
@@ -1654,11 +1690,14 @@ struct ProcessCreatedIssue {
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessPrCommentsTriageArtifact {
+    operation_id: String,
     dry_run: bool,
     guardrails: ProcessMutationGuardrailSettings,
     repo: String,
     pr: u64,
     fetched_at: u64,
+    duplicate_count: usize,
+    dedupe_keys_matched: Vec<String>,
     triage_items: Vec<ProcessCommentTriageItem>,
     grouped_by_decision: ProcessTriageCounts,
     created_issues: Vec<ProcessCreatedIssue>,
@@ -1726,19 +1765,20 @@ struct ProcessIssuesWatchArtifact {
     suggested_actions: Vec<String>,
 }
 
-#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum IssueWatchDecision {
     QuickFix,
     NeedsManual,
 }
 
-#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ProcessMutationSkipReason {
     MaxActItemsCapReached,
     ConfirmLabelMissing,
     MaxMutationsPerRunReached,
+    DedupeMatched,
 }
 
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
@@ -1772,6 +1812,7 @@ struct ProcessIssuesWatchActIssueAction {
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessIssuesWatchActArtifact {
+    operation_id: String,
     dry_run: bool,
     guardrails: ProcessMutationGuardrailSettings,
     fetched_at: u64,
@@ -1782,6 +1823,8 @@ struct ProcessIssuesWatchActArtifact {
     max_act_items: Option<usize>,
     acted_count: usize,
     skipped_count: usize,
+    duplicate_count: usize,
+    dedupe_keys_matched: Vec<String>,
     issue_actions: Vec<ProcessIssuesWatchActIssueAction>,
 }
 
@@ -1962,6 +2005,39 @@ struct GhRepoDefaultBranchRef {
     name: String,
 }
 
+#[derive(Debug, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredPrCommentsTriageArtifact {
+    repo: String,
+    pr: u64,
+    triage_items: Vec<StoredPrCommentsTriageItem>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredPrCommentsTriageItem {
+    comment_url: String,
+    decision: TriageDecision,
+    idempotent: Option<bool>,
+    quick_fix_success: Option<bool>,
+    created_issue_url: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredIssuesWatchActArtifact {
+    repo: String,
+    issue_actions: Vec<StoredIssuesWatchActIssueAction>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredIssuesWatchActIssueAction {
+    issue_number: u64,
+    decision: IssueWatchDecision,
+    success: bool,
+}
+
 fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
     let Some((owner, name)) = repo.split_once('/') else {
         anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
@@ -2101,6 +2177,126 @@ fn print_process_act_guardrail_summary(settings: &ProcessMutationGuardrailSettin
     );
 }
 
+fn build_process_act_operation_id(flow: &str, run_id: &str) -> String {
+    format!("{flow}-{run_id}")
+}
+
+fn triage_decision_key(decision: TriageDecision) -> &'static str {
+    match decision {
+        TriageDecision::QuickFix => "quick_fix",
+        TriageDecision::NeedsIssue => "needs_issue",
+        TriageDecision::Question => "question",
+    }
+}
+
+fn issue_watch_decision_key(decision: IssueWatchDecision) -> &'static str {
+    match decision {
+        IssueWatchDecision::QuickFix => "quick_fix",
+        IssueWatchDecision::NeedsManual => "needs_manual",
+    }
+}
+
+fn pr_comment_dedupe_key(
+    repo: &str,
+    pr: u64,
+    comment_url: &str,
+    decision: TriageDecision,
+) -> String {
+    format!(
+        "{repo}|{pr}|{comment_url}|{}",
+        triage_decision_key(decision)
+    )
+}
+
+fn issues_watch_dedupe_key(repo: &str, issue_number: u64, decision: IssueWatchDecision) -> String {
+    format!(
+        "{repo}|{issue_number}|{}",
+        issue_watch_decision_key(decision)
+    )
+}
+
+fn process_run_directories_before(run_id: &str) -> Vec<std::path::PathBuf> {
+    let runs_root = std::path::Path::new(".process/runs");
+    let mut run_dirs = match std::fs::read_dir(runs_root) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                let dir_name = path.file_name()?.to_str()?;
+                (dir_name != run_id).then_some(path)
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    run_dirs.sort();
+    run_dirs
+}
+
+fn is_pr_comment_previously_handled(item: &StoredPrCommentsTriageItem) -> bool {
+    if item.idempotent.unwrap_or(false) {
+        return false;
+    }
+    match item.decision {
+        TriageDecision::QuickFix => item.quick_fix_success == Some(true),
+        TriageDecision::NeedsIssue => item.created_issue_url.is_some(),
+        TriageDecision::Question => true,
+    }
+}
+
+fn build_pr_comments_dedupe_index(run_id: &str) -> std::collections::HashSet<String> {
+    let mut dedupe_keys = std::collections::HashSet::new();
+    for run_dir in process_run_directories_before(run_id) {
+        let triage_path = run_dir.join("triage.json");
+        let Ok(contents) = std::fs::read_to_string(&triage_path) else {
+            continue;
+        };
+        let Ok(artifact) = serde_json::from_str::<StoredPrCommentsTriageArtifact>(&contents) else {
+            continue;
+        };
+        for item in artifact.triage_items {
+            if is_pr_comment_previously_handled(&item) {
+                dedupe_keys.insert(pr_comment_dedupe_key(
+                    &artifact.repo,
+                    artifact.pr,
+                    &item.comment_url,
+                    item.decision,
+                ));
+            }
+        }
+    }
+    dedupe_keys
+}
+
+fn is_issue_watch_action_previously_handled(action: &StoredIssuesWatchActIssueAction) -> bool {
+    action.success
+}
+
+fn build_issues_watch_dedupe_index(run_id: &str) -> std::collections::HashSet<String> {
+    let mut dedupe_keys = std::collections::HashSet::new();
+    for run_dir in process_run_directories_before(run_id) {
+        let artifact_path = run_dir.join("issues-watch-act.json");
+        let Ok(contents) = std::fs::read_to_string(&artifact_path) else {
+            continue;
+        };
+        let Ok(artifact) = serde_json::from_str::<StoredIssuesWatchActArtifact>(&contents) else {
+            continue;
+        };
+        for action in artifact.issue_actions {
+            if is_issue_watch_action_previously_handled(&action) {
+                dedupe_keys.insert(issues_watch_dedupe_key(
+                    &artifact.repo,
+                    action.issue_number,
+                    action.decision,
+                ));
+            }
+        }
+    }
+    dedupe_keys
+}
+
 fn build_process_issues_watch_act_queue_plan(
     total_issues: usize,
     max_act_items: Option<usize>,
@@ -2165,18 +2361,61 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             args.confirm_label.as_deref(),
             args.max_mutations_per_run,
         );
+        let operation_id = build_process_act_operation_id("issues-watch-act", &run_id);
+        let dedupe_index = if args.no_dedupe {
+            std::collections::HashSet::new()
+        } else {
+            build_issues_watch_dedupe_index(&run_id)
+        };
+        let mut dedupe_keys_matched = std::collections::BTreeSet::new();
         print_process_act_guardrail_summary(&guardrails);
         if guardrails.active && guardrails.require_clean_worktree {
             ensure_clean_git_worktree_for_mutations()?;
         }
         let max_act_items = args.max_act_items.map(|value| value as usize);
-        let queue_plan = build_process_issues_watch_act_queue_plan(issues.len(), max_act_items);
-
         let mut issue_actions = vec![None; issues.len()];
+        let mut deduped_issue_indices = std::collections::HashSet::new();
+        if !args.no_dedupe {
+            for (issue_index, issue) in issues.iter().enumerate() {
+                let decision = classify_issue_watch_triage(issue);
+                let dedupe_key = issues_watch_dedupe_key(&args.repo, issue.number, decision);
+                if dedupe_index.contains(&dedupe_key) {
+                    let reason = ProcessMutationSkipReason::DedupeMatched;
+                    issue_actions[issue_index] = Some(ProcessIssuesWatchActIssueAction {
+                        issue_number: issue.number,
+                        issue_url: issue.url.clone(),
+                        decision,
+                        planned_action: format_issues_watch_planned_action(
+                            decision,
+                            Some(reason),
+                            args.dry_run,
+                        ),
+                        skipped_reasons: vec![reason],
+                        attempted: false,
+                        success: false,
+                        branch: None,
+                        commit_sha: None,
+                        commit_url: None,
+                        pr_url: None,
+                        pr_number: None,
+                        update_comment_url: None,
+                        error: Some("Skipped due to dedupe: already successfully handled in a previous run.".to_string()),
+                    });
+                    deduped_issue_indices.insert(issue_index);
+                    dedupe_keys_matched.insert(dedupe_key);
+                }
+            }
+        }
+        let act_candidates = (0..issues.len())
+            .filter(|issue_index| !deduped_issue_indices.contains(issue_index))
+            .collect::<Vec<_>>();
+        let queue_plan =
+            build_process_issues_watch_act_queue_plan(act_candidates.len(), max_act_items);
         for skipped in &queue_plan.skipped {
-            let issue = &issues[skipped.issue_index];
+            let issue_index = act_candidates[skipped.issue_index];
+            let issue = &issues[issue_index];
             let decision = classify_issue_watch_triage(issue);
-            issue_actions[skipped.issue_index] = Some(ProcessIssuesWatchActIssueAction {
+            issue_actions[issue_index] = Some(ProcessIssuesWatchActIssueAction {
                 issue_number: issue.number,
                 issue_url: issue.url.clone(),
                 decision,
@@ -2199,7 +2438,8 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
         }
 
         if args.dry_run {
-            for &issue_index in &queue_plan.acted_indices {
+            for &queue_index in &queue_plan.acted_indices {
+                let issue_index = act_candidates[queue_index];
                 let issue = &issues[issue_index];
                 let decision = classify_issue_watch_triage(issue);
                 issue_actions[issue_index] = Some(ProcessIssuesWatchActIssueAction {
@@ -2249,7 +2489,10 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             let act_queue = queue_plan
                 .acted_indices
                 .iter()
-                .map(|&index| (index, issues[index].clone()))
+                .map(|&queue_index| {
+                    let issue_index = act_candidates[queue_index];
+                    (issue_index, issues[issue_index].clone())
+                })
                 .collect::<std::collections::VecDeque<_>>();
             let total_to_act = act_queue.len();
             if !act_queue.is_empty() {
@@ -2625,6 +2868,7 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             .filter(|action| !action.skipped_reasons.is_empty())
             .count();
         let act_artifact = ProcessIssuesWatchActArtifact {
+            operation_id,
             dry_run: args.dry_run,
             guardrails: guardrails.clone(),
             fetched_at,
@@ -2635,6 +2879,8 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             max_act_items,
             acted_count: queue_plan.acted_indices.len(),
             skipped_count,
+            duplicate_count: deduped_issue_indices.len(),
+            dedupe_keys_matched: dedupe_keys_matched.into_iter().collect(),
             issue_actions,
         };
         std::fs::write(
@@ -3208,6 +3454,9 @@ fn format_pr_comments_planned_action(
             ProcessMutationSkipReason::MaxMutationsPerRunReached => {
                 "Skipped: max mutations-per-run cap reached.".to_string()
             }
+            ProcessMutationSkipReason::DedupeMatched => {
+                "Skipped: idempotent dedupe matched a previously handled item.".to_string()
+            }
         };
     }
 
@@ -3240,6 +3489,9 @@ fn format_issues_watch_planned_action(
             }
             ProcessMutationSkipReason::MaxMutationsPerRunReached => {
                 "Skipped: max mutations-per-run cap reached.".to_string()
+            }
+            ProcessMutationSkipReason::DedupeMatched => {
+                "Skipped: dedupe matched a previously successful issue action.".to_string()
             }
         };
     }
@@ -5083,6 +5335,7 @@ mod tests {
             require_clean_worktree,
             confirm_label,
             max_mutations_per_run,
+            no_dedupe,
         }) = sub
         else {
             panic!("expected process pr-comments");
@@ -5096,6 +5349,7 @@ mod tests {
         assert!(!require_clean_worktree);
         assert_eq!(confirm_label, None);
         assert_eq!(max_mutations_per_run, None);
+        assert!(!no_dedupe);
     }
 
     #[test]
@@ -5145,6 +5399,29 @@ mod tests {
     }
 
     #[test]
+    fn process_pr_comments_parses_no_dedupe_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+            "--act",
+            "--no-dedupe",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { no_dedupe, .. }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert!(no_dedupe);
+    }
+
+    #[test]
     fn process_issues_watch_parses_args() {
         let cli = MultitoolCli::try_parse_from([
             "codex",
@@ -5177,6 +5454,7 @@ mod tests {
             max_concurrency,
             queue_delay_ms,
             max_act_items,
+            no_dedupe,
         }) = sub;
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(label, "process:auto-fix");
@@ -5189,6 +5467,7 @@ mod tests {
         assert_eq!(max_concurrency, DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY);
         assert_eq!(queue_delay_ms, DEFAULT_ISSUES_WATCH_QUEUE_DELAY_MS);
         assert_eq!(max_act_items, None);
+        assert!(!no_dedupe);
     }
 
     #[test]
@@ -5280,6 +5559,31 @@ mod tests {
         assert_eq!(max_concurrency, 3);
         assert_eq!(queue_delay_ms, 400);
         assert_eq!(max_act_items, Some(5));
+    }
+
+    #[test]
+    fn process_issues_watch_parses_no_dedupe_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--act",
+            "--no-dedupe",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { no_dedupe, .. }) = sub;
+        assert!(no_dedupe);
     }
 
     #[test]
@@ -5375,6 +5679,78 @@ mod tests {
             err.to_string(),
             "Invalid --repo value `openai/codex/extra`. Expected `owner/name`."
         );
+    }
+
+    #[test]
+    fn pr_comment_dedupe_key_contains_repo_pr_url_and_decision() {
+        let key = pr_comment_dedupe_key(
+            "openai/codex-process",
+            42,
+            "https://github.com/openai/codex-process/pull/42#discussion_r7",
+            TriageDecision::NeedsIssue,
+        );
+        assert_eq!(
+            key,
+            "openai/codex-process|42|https://github.com/openai/codex-process/pull/42#discussion_r7|needs_issue"
+        );
+    }
+
+    #[test]
+    fn issues_watch_dedupe_key_contains_repo_issue_number_and_decision() {
+        let key = issues_watch_dedupe_key("openai/codex-process", 77, IssueWatchDecision::QuickFix);
+        assert_eq!(key, "openai/codex-process|77|quick_fix");
+    }
+
+    #[test]
+    fn is_pr_comment_previously_handled_respects_decision_and_idempotent() {
+        let quick_fix = StoredPrCommentsTriageItem {
+            comment_url: "https://example.com/c1".to_string(),
+            decision: TriageDecision::QuickFix,
+            idempotent: None,
+            quick_fix_success: Some(true),
+            created_issue_url: None,
+        };
+        let needs_issue = StoredPrCommentsTriageItem {
+            comment_url: "https://example.com/c2".to_string(),
+            decision: TriageDecision::NeedsIssue,
+            idempotent: None,
+            quick_fix_success: None,
+            created_issue_url: Some("https://github.com/openai/codex-process/issues/1".to_string()),
+        };
+        let question = StoredPrCommentsTriageItem {
+            comment_url: "https://example.com/c3".to_string(),
+            decision: TriageDecision::Question,
+            idempotent: None,
+            quick_fix_success: None,
+            created_issue_url: None,
+        };
+        let idempotent_skip = StoredPrCommentsTriageItem {
+            comment_url: "https://example.com/c4".to_string(),
+            decision: TriageDecision::QuickFix,
+            idempotent: Some(true),
+            quick_fix_success: Some(true),
+            created_issue_url: None,
+        };
+        assert!(is_pr_comment_previously_handled(&quick_fix));
+        assert!(is_pr_comment_previously_handled(&needs_issue));
+        assert!(is_pr_comment_previously_handled(&question));
+        assert!(!is_pr_comment_previously_handled(&idempotent_skip));
+    }
+
+    #[test]
+    fn is_issue_watch_action_previously_handled_requires_success() {
+        let success = StoredIssuesWatchActIssueAction {
+            issue_number: 5,
+            decision: IssueWatchDecision::QuickFix,
+            success: true,
+        };
+        let failure = StoredIssuesWatchActIssueAction {
+            issue_number: 6,
+            decision: IssueWatchDecision::QuickFix,
+            success: false,
+        };
+        assert!(is_issue_watch_action_previously_handled(&success));
+        assert!(!is_issue_watch_action_previously_handled(&failure));
     }
 
     #[test]
@@ -5633,6 +6009,32 @@ mod tests {
     }
 
     #[test]
+    fn format_pr_comments_planned_action_mentions_dedupe_skip() {
+        let planned = format_pr_comments_planned_action(
+            TriageDecision::QuickFix,
+            Some(ProcessMutationSkipReason::DedupeMatched),
+            false,
+        );
+        assert_eq!(
+            planned,
+            "Skipped: idempotent dedupe matched a previously handled item.".to_string()
+        );
+    }
+
+    #[test]
+    fn format_issues_watch_planned_action_mentions_dedupe_skip() {
+        let planned = format_issues_watch_planned_action(
+            IssueWatchDecision::QuickFix,
+            Some(ProcessMutationSkipReason::DedupeMatched),
+            false,
+        );
+        assert_eq!(
+            planned,
+            "Skipped: dedupe matched a previously successful issue action.".to_string()
+        );
+    }
+
+    #[test]
     fn parse_git_status_porcelain_entries_handles_clean_and_dirty_worktrees() {
         assert_eq!(parse_git_status_porcelain_entries(""), Vec::<String>::new());
         assert_eq!(
@@ -5883,6 +6285,8 @@ mod tests {
                 comment_url: "https://github.com/openai/codex-process/pull/42#discussion_r1"
                     .to_string(),
                 decision: TriageDecision::QuickFix,
+                dedupe_key: "openai/codex-process|42|https://github.com/openai/codex-process/pull/42#discussion_r1|quick_fix".to_string(),
+                idempotent: false,
                 planned_action: "Plan: run targeted quick-fix automation (codex subprocess + branch/commit/push + follow-up PR/comment updates).".to_string(),
                 skipped_reasons: Vec::new(),
                 created_issue_url: None,
