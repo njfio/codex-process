@@ -1086,6 +1086,7 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         .map(|comment| ProcessCommentTriageItem {
             source: "review_comment".to_string(),
             comment_id: comment.id.clone(),
+            review_thread_id: comment.review_thread_id.clone(),
             author: comment.author.clone(),
             body: comment.body.clone(),
             comment_url: comment.url.clone(),
@@ -1105,12 +1106,15 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_pr_number: None,
             quick_fix_push_error: None,
             quick_fix_pr_error: None,
+            quick_fix_thread_resolved: None,
+            quick_fix_thread_resolve_error: None,
         })
         .collect::<Vec<_>>();
     triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
         ProcessCommentTriageItem {
             source: "issue_comment".to_string(),
             comment_id: comment.id.clone(),
+            review_thread_id: None,
             author: comment.author.clone(),
             body: comment.body.clone(),
             comment_url: comment.url.clone(),
@@ -1130,6 +1134,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             quick_fix_pr_number: None,
             quick_fix_push_error: None,
             quick_fix_pr_error: None,
+            quick_fix_thread_resolved: None,
+            quick_fix_thread_resolve_error: None,
         }
     }));
 
@@ -1235,6 +1241,21 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                 item.quick_fix_pr_number = execution.follow_up_pr_number;
                 item.quick_fix_push_error = execution.push_error.clone();
                 item.quick_fix_pr_error = execution.pr_error.clone();
+                if execution.follow_up_pr_url.is_some()
+                    && item.source == "review_comment"
+                    && let Some(review_thread_id) = item.review_thread_id.as_deref()
+                {
+                    match resolve_review_thread(review_thread_id) {
+                        Ok(()) => {
+                            item.quick_fix_thread_resolved = Some(true);
+                            item.quick_fix_thread_resolve_error = None;
+                        }
+                        Err(err) => {
+                            item.quick_fix_thread_resolved = Some(false);
+                            item.quick_fix_thread_resolve_error = Some(err.to_string());
+                        }
+                    }
+                }
                 if execution.success {
                     let summary = execution_summary
                         .unwrap_or_else(|| "Applied targeted quick fix.".to_string());
@@ -1247,6 +1268,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
                         commit_url: execution.commit_url,
                         follow_up_pr_url: execution.follow_up_pr_url,
                         follow_up_pr_number: execution.follow_up_pr_number,
+                        thread_resolved: item.quick_fix_thread_resolved,
+                        thread_resolve_error: item.quick_fix_thread_resolve_error.clone(),
                     });
                 } else {
                     item.todo = Some(format!(
@@ -1338,6 +1361,7 @@ struct ProcessPrCommentsArtifact {
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 struct UnresolvedReviewComment {
     id: String,
+    review_thread_id: Option<String>,
     author: String,
     path: String,
     line: Option<u64>,
@@ -1374,6 +1398,7 @@ enum TriageDecision {
 struct ProcessCommentTriageItem {
     source: String,
     comment_id: String,
+    review_thread_id: Option<String>,
     author: String,
     body: String,
     comment_url: String,
@@ -1393,6 +1418,8 @@ struct ProcessCommentTriageItem {
     quick_fix_pr_number: Option<u64>,
     quick_fix_push_error: Option<String>,
     quick_fix_pr_error: Option<String>,
+    quick_fix_thread_resolved: Option<bool>,
+    quick_fix_thread_resolve_error: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone, Default, PartialEq, Eq)]
@@ -1452,6 +1479,8 @@ struct QuickFixSummary {
     commit_url: Option<String>,
     follow_up_pr_url: Option<String>,
     follow_up_pr_number: Option<u64>,
+    thread_resolved: Option<bool>,
+    thread_resolve_error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1502,6 +1531,30 @@ struct GhGraphQlData {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct GhResolveReviewThreadResponse {
+    data: Option<GhResolveReviewThreadData>,
+    errors: Option<Vec<GhGraphQlError>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhResolveReviewThreadData {
+    #[serde(rename = "resolveReviewThread")]
+    resolve_review_thread: Option<GhResolveReviewThreadPayload>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhResolveReviewThreadPayload {
+    thread: Option<GhResolveReviewThreadNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhResolveReviewThreadNode {
+    id: String,
+    is_resolved: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct GhRepository {
     #[serde(rename = "pullRequest")]
     pull_request: Option<GhPullRequest>,
@@ -1523,6 +1576,7 @@ struct GhReviewThreadConnection {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhReviewThreadNode {
+    id: String,
     is_resolved: bool,
     comments: GhReviewCommentConnection,
 }
@@ -1646,6 +1700,7 @@ fn fetch_unresolved_review_comments(
     pullRequest(number: $pr) {
       reviewThreads(first: 100, after: $cursor) {
         nodes {
+          id
           isResolved
           comments(first: 100) {
             nodes {
@@ -1768,6 +1823,27 @@ fn fetch_pr_base_branch_name(repo: &str, pr: u64) -> anyhow::Result<Option<Strin
     Ok(Some(parsed.base_ref_name))
 }
 
+fn resolve_review_thread(thread_id: &str) -> anyhow::Result<()> {
+    const GRAPHQL_MUTATION: &str = r#"mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}"#;
+    let args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={GRAPHQL_MUTATION}"),
+        "-F".to_string(),
+        format!("threadId={thread_id}"),
+    ];
+    let response = run_gh_json_command(&args)?;
+    parse_resolve_review_thread_response(response)
+}
+
 fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
     let output = std::process::Command::new("gh")
         .args(args)
@@ -1875,16 +1951,23 @@ fn parse_unresolved_review_comment_page(
         .nodes
         .into_iter()
         .filter(|thread| !thread.is_resolved)
-        .flat_map(|thread| thread.comments.nodes)
-        .map(|comment| UnresolvedReviewComment {
-            id: comment.id,
-            author: comment
-                .author
-                .map_or_else(|| "unknown".to_string(), |author| author.login),
-            path: comment.path,
-            line: comment.line,
-            body: comment.body,
-            url: comment.url,
+        .flat_map(|thread| {
+            let review_thread_id = thread.id;
+            thread
+                .comments
+                .nodes
+                .into_iter()
+                .map(move |comment| UnresolvedReviewComment {
+                    id: comment.id,
+                    review_thread_id: Some(review_thread_id.clone()),
+                    author: comment
+                        .author
+                        .map_or_else(|| "unknown".to_string(), |author| author.login),
+                    path: comment.path,
+                    line: comment.line,
+                    body: comment.body,
+                    url: comment.url,
+                })
         })
         .collect();
 
@@ -1893,6 +1976,39 @@ fn parse_unresolved_review_comment_page(
         has_next_page: review_threads.page_info.has_next_page,
         end_cursor: review_threads.page_info.end_cursor,
     })
+}
+
+fn parse_resolve_review_thread_response(response_json: serde_json::Value) -> anyhow::Result<()> {
+    let response: GhResolveReviewThreadResponse = serde_json::from_value(response_json)
+        .context("Failed to parse GitHub GraphQL resolveReviewThread response")?;
+
+    if let Some(errors) = response.errors
+        && !errors.is_empty()
+    {
+        let messages = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("GitHub GraphQL returned errors: {messages}");
+    }
+
+    let thread = response
+        .data
+        .and_then(|data| data.resolve_review_thread)
+        .and_then(|payload| payload.thread)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "GitHub GraphQL response did not include resolveReviewThread.thread data."
+            )
+        })?;
+    if !thread.is_resolved {
+        anyhow::bail!(
+            "GitHub GraphQL resolveReviewThread returned unresolved thread {}.",
+            thread.id
+        );
+    }
+    Ok(())
 }
 
 fn parse_issue_comments(issue_json: serde_json::Value) -> anyhow::Result<Vec<OpenIssueComment>> {
@@ -2489,6 +2605,16 @@ fn format_pr_update_comment_body(summaries: &[QuickFixSummary]) -> String {
                 line.push_str(&format!("; follow-up PR: [#{pr_number}]({pr_url})"));
             } else {
                 line.push_str(&format!("; follow-up PR: {pr_url}"));
+            }
+        }
+        if let Some(thread_resolved) = item.thread_resolved {
+            if thread_resolved {
+                line.push_str("; review thread: resolved");
+            } else {
+                line.push_str("; review thread: resolution failed");
+                if let Some(resolve_error) = &item.thread_resolve_error {
+                    line.push_str(&format!(" ({resolve_error})"));
+                }
             }
         }
         body.push_str(&line);
@@ -3491,6 +3617,7 @@ mod tests {
                         "reviewThreads": {
                             "nodes": [
                                 {
+                                    "id": "PRRT_1",
                                     "isResolved": false,
                                     "comments": {
                                         "nodes": [
@@ -3506,6 +3633,7 @@ mod tests {
                                     }
                                 },
                                 {
+                                    "id": "PRRT_2",
                                     "isResolved": true,
                                     "comments": {
                                         "nodes": [
@@ -3536,6 +3664,7 @@ mod tests {
             parsed.comments,
             vec![UnresolvedReviewComment {
                 id: "PRRC_1".to_string(),
+                review_thread_id: Some("PRRT_1".to_string()),
                 author: "alice".to_string(),
                 path: "src/lib.rs".to_string(),
                 line: Some(42),
@@ -3689,10 +3818,33 @@ mod tests {
             ),
             follow_up_pr_url: Some("https://github.com/openai/codex-process/pull/77".to_string()),
             follow_up_pr_number: Some(77),
+            thread_resolved: Some(true),
+            thread_resolve_error: None,
         }]);
         assert_eq!(
             body,
-            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef); follow-up PR: [#77](https://github.com/openai/codex-process/pull/77)\n"
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_123`: Applied minimal fix (files: codex-rs/cli/src/main.rs); verification: not run; commit: [`0123456789ab`](https://github.com/openai/codex-process/commit/0123456789abcdef); follow-up PR: [#77](https://github.com/openai/codex-process/pull/77); review thread: resolved\n"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn format_pr_update_comment_body_includes_thread_resolution_failure_details() {
+        let body = format_pr_update_comment_body(&[QuickFixSummary {
+            comment_id: "PRRC_321".to_string(),
+            summary: "Applied follow-up change".to_string(),
+            files: Vec::new(),
+            verification: None,
+            commit_sha: None,
+            commit_url: None,
+            follow_up_pr_url: Some("https://github.com/openai/codex-process/pull/89".to_string()),
+            follow_up_pr_number: Some(89),
+            thread_resolved: Some(false),
+            thread_resolve_error: Some("Forbidden".to_string()),
+        }]);
+        assert_eq!(
+            body,
+            "Quick-fix update from `codex process pr-comments --act`.\n\nApplied items:\n- `PRRC_321`: Applied follow-up change; follow-up PR: [#89](https://github.com/openai/codex-process/pull/89); review thread: resolution failed (Forbidden)\n"
                 .to_string()
         );
     }
@@ -3738,6 +3890,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_resolve_review_thread_response_accepts_resolved_thread() {
+        let input = serde_json::json!({
+            "data": {
+                "resolveReviewThread": {
+                    "thread": {
+                        "id": "PRRT_1",
+                        "isResolved": true
+                    }
+                }
+            }
+        });
+        parse_resolve_review_thread_response(input).expect("parse should succeed");
+    }
+
+    #[test]
+    fn parse_resolve_review_thread_response_reports_graphql_errors() {
+        let input = serde_json::json!({
+            "errors": [
+                { "message": "Forbidden" }
+            ]
+        });
+        let err = parse_resolve_review_thread_response(input).expect_err("parse should fail");
+        assert_eq!(err.to_string(), "GitHub GraphQL returned errors: Forbidden");
+    }
+
+    #[test]
+    fn parse_resolve_review_thread_response_reports_missing_thread_data() {
+        let input = serde_json::json!({
+            "data": {
+                "resolveReviewThread": {
+                    "thread": null
+                }
+            }
+        });
+        let err = parse_resolve_review_thread_response(input).expect_err("parse should fail");
+        assert_eq!(
+            err.to_string(),
+            "GitHub GraphQL response did not include resolveReviewThread.thread data."
+        );
+    }
+
+    #[test]
     fn format_quick_fix_follow_up_pr_body_includes_required_links_and_optional_commit() {
         let body = format_quick_fix_follow_up_pr_body(
             "openai/codex-process",
@@ -3745,6 +3939,7 @@ mod tests {
             &ProcessCommentTriageItem {
                 source: "review_comment".to_string(),
                 comment_id: "PRRC_1".to_string(),
+                review_thread_id: Some("PRRT_1".to_string()),
                 author: "reviewer".to_string(),
                 body: "Please tighten this check.".to_string(),
                 comment_url: "https://github.com/openai/codex-process/pull/42#discussion_r1"
@@ -3767,6 +3962,8 @@ mod tests {
                 quick_fix_pr_number: None,
                 quick_fix_push_error: None,
                 quick_fix_pr_error: None,
+                quick_fix_thread_resolved: None,
+                quick_fix_thread_resolve_error: None,
             },
             Some("https://github.com/openai/codex-process/commit/abc"),
         );
