@@ -92,6 +92,7 @@ Input = list[InputItem] | InputItem
 class InitializeResult:
     server_name: str | None = None
     server_version: str | None = None
+    user_agent: str | None = None
 
 
 def _to_wire_item(item: InputItem) -> JsonObject:
@@ -114,6 +115,19 @@ def _to_wire_input(input: Input) -> list[JsonObject]:
     return [_to_wire_item(input)]
 
 
+def _split_user_agent(user_agent: str) -> tuple[str | None, str | None]:
+    raw = user_agent.strip()
+    if not raw:
+        return None, None
+    if "/" in raw:
+        name, version = raw.split("/", 1)
+        return (name or None), (version or None)
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return raw, None
+
+
 class Codex:
     """Minimal typed SDK surface for app-server v2."""
 
@@ -130,12 +144,27 @@ class Codex:
 
     @staticmethod
     def _parse_initialize(payload: InitializeResponse) -> InitializeResult:
+        user_agent = payload.userAgent
         server = payload.serverInfo
-        if server is None:
-            return InitializeResult()
+
+        server_name: str | None = None
+        server_version: str | None = None
+
+        if server is not None:
+            server_name = server.name
+            server_version = server.version
+
+        if (server_name is None or server_version is None) and user_agent:
+            parsed_name, parsed_version = _split_user_agent(user_agent)
+            if server_name is None:
+                server_name = parsed_name
+            if server_version is None:
+                server_version = parsed_version
+
         return InitializeResult(
-            server_name=server.name,
-            server_version=server.version,
+            server_name=server_name,
+            server_version=server_version,
+            user_agent=user_agent,
         )
 
     @property

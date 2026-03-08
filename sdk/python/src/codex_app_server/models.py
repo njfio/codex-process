@@ -5,6 +5,7 @@ from typing import TypeAlias
 
 from pydantic import BaseModel
 
+from .generated.codex_event_types import CodexEventNotification
 from .generated.v2_all.AccountLoginCompletedNotification import (
     AccountLoginCompletedNotification,
 )
@@ -95,6 +96,7 @@ NotificationPayload: TypeAlias = (
     | TurnPlanUpdatedNotification
     | TurnStartedNotification
     | WindowsWorldWritableWarningNotification
+    | CodexEventNotification
     | UnknownNotification
 )
 
@@ -104,6 +106,7 @@ class Notification:
     method: str
     payload: NotificationPayload
 
+
 class ServerInfo(BaseModel):
     name: str | None = None
     version: str | None = None
@@ -111,6 +114,7 @@ class ServerInfo(BaseModel):
 
 class InitializeResponse(BaseModel):
     serverInfo: ServerInfo | None = None
+    userAgent: str | None = None
 
 
 @dataclass(slots=True)

@@ -16,6 +16,8 @@ python examples/<example-folder>/sync.py
 python examples/<example-folder>/async.py
 ```
 
+The examples bootstrap local imports from `sdk/python/src` automatically, so no `pip install -e .` step is required to run them from this repository checkout.
+
 ## Recommended first run
 
 ```bash

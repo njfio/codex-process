@@ -57,7 +57,6 @@ def _run_example(
     assert path.exists(), f"Missing example script: {path}"
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
     # Feed '/exit' only to interactive mini-cli examples.
     stdin = "/exit\n" if folder == "11_cli_mini_app" else None

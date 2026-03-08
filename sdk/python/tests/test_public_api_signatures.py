@@ -5,6 +5,7 @@ import inspect
 from typing import Any
 
 from codex_app_server import AppServerConfig
+from codex_app_server.models import InitializeResponse
 from codex_app_server.public_api import AsyncCodex, AsyncThread, Codex, Thread
 
 
@@ -176,3 +177,10 @@ def test_lifecycle_methods_are_codex_scoped() -> None:
         AsyncCodex.thread_unarchive,
     ):
         _assert_no_any_annotations(fn)
+
+
+def test_initialize_metadata_parses_user_agent_shape() -> None:
+    parsed = Codex._parse_initialize(InitializeResponse.model_validate({"userAgent": "codex-cli/1.2.3"}))
+    assert parsed.user_agent == "codex-cli/1.2.3"
+    assert parsed.server_name == "codex-cli"
+    assert parsed.server_version == "1.2.3"

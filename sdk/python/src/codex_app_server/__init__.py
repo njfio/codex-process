@@ -13,7 +13,12 @@ from .errors import (
     TransportClosedError,
     is_retryable_error,
 )
-from .generated.v2_types import ThreadItem
+from .generated.codex_event_types import CodexEventNotification, CodexEventType
+from .generated.v2_types import (
+    ThreadItem,
+    ThreadTokenUsageUpdatedNotification,
+    TurnCompletedNotificationPayload,
+)
 from .public_api import (
     AsyncCodex,
     AsyncThread,
@@ -66,6 +71,10 @@ __all__ = [
     "SkillInput",
     "MentionInput",
     "ThreadItem",
+    "ThreadTokenUsageUpdatedNotification",
+    "TurnCompletedNotificationPayload",
+    "CodexEventNotification",
+    "CodexEventType",
     "ThreadStartParams",
     "ThreadResumeParams",
     "ThreadListParams",

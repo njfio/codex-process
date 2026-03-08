@@ -1,4 +1,20 @@
-from codex_app_server import Codex, TextInput
+import sys
+from pathlib import Path
+
+_EXAMPLES_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXAMPLES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_ROOT))
+
+from _bootstrap import ensure_local_sdk_src
+
+ensure_local_sdk_src()
+
+from codex_app_server import (
+    Codex,
+    TextInput,
+    ThreadTokenUsageUpdatedNotification,
+    TurnCompletedNotificationPayload,
+)
 
 print("Codex mini CLI. Type /exit to quit.")
 
@@ -46,19 +62,19 @@ with Codex() as codex:
 
         print("assistant> ", end="", flush=True)
         for event in turn.stream():
+            payload = event.payload
             if event.method == "item/agentMessage/delta":
-                delta = getattr(event.payload, "delta", "")
+                delta = getattr(payload, "delta", "")
                 if delta:
                     print(delta, end="", flush=True)
                     printed_delta = True
                 continue
-            if event.method == "thread/token_usage_updated":
-                usage = getattr(event.payload, "tokenUsage", None)
+            if isinstance(payload, ThreadTokenUsageUpdatedNotification):
+                usage = payload.tokenUsage
                 continue
-            if event.method == "turn/completed":
-                completed_turn = getattr(event.payload, "turn", None)
-                status = getattr(completed_turn, "status", None)
-                error = getattr(completed_turn, "error", None)
+            if isinstance(payload, TurnCompletedNotificationPayload):
+                status = payload.turn.status
+                error = payload.turn.error
 
         if printed_delta:
             print()

@@ -14,72 +14,30 @@ from pydantic import BaseModel
 
 from .conversation import ThreadSession
 from .errors import AppServerError, TransportClosedError, map_jsonrpc_error
-from .generated.v2_all.AccountLoginCompletedNotification import (
-    AccountLoginCompletedNotification,
-)
-from .generated.v2_all.AccountRateLimitsUpdatedNotification import (
-    AccountRateLimitsUpdatedNotification,
-)
-from .generated.v2_all.AccountUpdatedNotification import AccountUpdatedNotification
 from .generated.v2_all.AgentMessageDeltaNotification import AgentMessageDeltaNotification
-from .generated.v2_all.AppListUpdatedNotification import AppListUpdatedNotification
-from .generated.v2_all.CommandExecutionOutputDeltaNotification import (
-    CommandExecutionOutputDeltaNotification,
-)
-from .generated.v2_all.ConfigWarningNotification import ConfigWarningNotification
-from .generated.v2_all.ContextCompactedNotification import ContextCompactedNotification
-from .generated.v2_all.DeprecationNoticeNotification import DeprecationNoticeNotification
-from .generated.v2_all.ErrorNotification import ErrorNotification
-from .generated.v2_all.FileChangeOutputDeltaNotification import (
-    FileChangeOutputDeltaNotification,
-)
-from .generated.v2_all.ItemCompletedNotification import ItemCompletedNotification
-from .generated.v2_all.ItemStartedNotification import ItemStartedNotification
-from .generated.v2_all.McpServerOauthLoginCompletedNotification import (
-    McpServerOauthLoginCompletedNotification,
-)
-from .generated.v2_all.McpToolCallProgressNotification import McpToolCallProgressNotification
 from .generated.v2_all.ModelListResponse import ModelListResponse
-from .generated.v2_all.PlanDeltaNotification import PlanDeltaNotification
-from .generated.v2_all.RawResponseItemCompletedNotification import (
-    RawResponseItemCompletedNotification,
-)
-from .generated.v2_all.ReasoningSummaryPartAddedNotification import (
-    ReasoningSummaryPartAddedNotification,
-)
-from .generated.v2_all.ReasoningSummaryTextDeltaNotification import (
-    ReasoningSummaryTextDeltaNotification,
-)
-from .generated.v2_all.ReasoningTextDeltaNotification import ReasoningTextDeltaNotification
-from .generated.v2_all.TerminalInteractionNotification import TerminalInteractionNotification
 from .generated.v2_all.ThreadArchiveResponse import ThreadArchiveResponse
 from .generated.v2_all.ThreadCompactStartResponse import ThreadCompactStartResponse
 from .generated.v2_all.ThreadForkParams import ThreadForkParams as V2ThreadForkParams
 from .generated.v2_all.ThreadForkResponse import ThreadForkResponse
 from .generated.v2_all.ThreadListParams import ThreadListParams as V2ThreadListParams
 from .generated.v2_all.ThreadListResponse import ThreadListResponse
-from .generated.v2_all.ThreadNameUpdatedNotification import ThreadNameUpdatedNotification
 from .generated.v2_all.ThreadReadResponse import ThreadReadResponse
 from .generated.v2_all.ThreadResumeParams import ThreadResumeParams as V2ThreadResumeParams
 from .generated.v2_all.ThreadResumeResponse import ThreadResumeResponse
 from .generated.v2_all.ThreadSetNameResponse import ThreadSetNameResponse
 from .generated.v2_all.ThreadStartParams import ThreadStartParams as V2ThreadStartParams
 from .generated.v2_all.ThreadStartResponse import ThreadStartResponse
-from .generated.v2_all.ThreadStartedNotification import ThreadStartedNotification
-from .generated.v2_all.ThreadTokenUsageUpdatedNotification import (
-    ThreadTokenUsageUpdatedNotification,
-)
 from .generated.v2_all.ThreadUnarchiveResponse import ThreadUnarchiveResponse
 from .generated.v2_all.TurnCompletedNotification import TurnCompletedNotification
-from .generated.v2_all.TurnDiffUpdatedNotification import TurnDiffUpdatedNotification
 from .generated.v2_all.TurnInterruptResponse import TurnInterruptResponse
-from .generated.v2_all.TurnPlanUpdatedNotification import TurnPlanUpdatedNotification
 from .generated.v2_all.TurnStartParams import TurnStartParams as V2TurnStartParams
 from .generated.v2_all.TurnStartResponse import TurnStartResponse
-from .generated.v2_all.TurnStartedNotification import TurnStartedNotification
 from .generated.v2_all.TurnSteerResponse import TurnSteerResponse
-from .generated.v2_all.WindowsWorldWritableWarningNotification import (
-    WindowsWorldWritableWarningNotification,
+from .generated.codex_event_types import CodexEventNotification
+from .generated.notification_registry import (
+    NOTIFICATION_METHOD_ALIASES,
+    NOTIFICATION_MODELS,
 )
 from .models import (
     InitializeResponse,
@@ -106,39 +64,6 @@ def _params_dict(params: V2ThreadStartParams | V2ThreadResumeParams | V2ThreadLi
     if isinstance(params, dict):
         return params
     raise TypeError(f"Expected generated params model or dict, got {type(params).__name__}")
-
-
-_NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
-    "account/loginCompleted": AccountLoginCompletedNotification,
-    "account/rateLimitsUpdated": AccountRateLimitsUpdatedNotification,
-    "account/updated": AccountUpdatedNotification,
-    "app/listUpdated": AppListUpdatedNotification,
-    "commandExecution/outputDelta": CommandExecutionOutputDeltaNotification,
-    "config/warning": ConfigWarningNotification,
-    "context/compacted": ContextCompactedNotification,
-    "deprecationNotice": DeprecationNoticeNotification,
-    "error": ErrorNotification,
-    "fileChange/outputDelta": FileChangeOutputDeltaNotification,
-    "item/agentMessage/delta": AgentMessageDeltaNotification,
-    "item/completed": ItemCompletedNotification,
-    "item/started": ItemStartedNotification,
-    "mcp/serverOauthLoginCompleted": McpServerOauthLoginCompletedNotification,
-    "mcp/toolCallProgress": McpToolCallProgressNotification,
-    "plan/delta": PlanDeltaNotification,
-    "rawResponseItem/completed": RawResponseItemCompletedNotification,
-    "reasoning/summaryPartAdded": ReasoningSummaryPartAddedNotification,
-    "reasoning/summaryTextDelta": ReasoningSummaryTextDeltaNotification,
-    "reasoning/textDelta": ReasoningTextDeltaNotification,
-    "terminal/interaction": TerminalInteractionNotification,
-    "thread/nameUpdated": ThreadNameUpdatedNotification,
-    "thread/started": ThreadStartedNotification,
-    "thread/tokenUsageUpdated": ThreadTokenUsageUpdatedNotification,
-    "turn/completed": TurnCompletedNotification,
-    "turn/diffUpdated": TurnDiffUpdatedNotification,
-    "turn/planUpdated": TurnPlanUpdatedNotification,
-    "turn/started": TurnStartedNotification,
-    "windows/worldWritableWarning": WindowsWorldWritableWarningNotification,
-}
 
 
 def _bundled_codex_path() -> Path:
@@ -564,13 +489,26 @@ class AppServerClient:
                 break
 
     def _coerce_notification(self, method: str, params: object) -> Notification:
-        model = _NOTIFICATION_MODELS.get(method)
         params_dict = params if isinstance(params, dict) else {}
+
+        if method.startswith("codex/event/"):
+            try:
+                payload = CodexEventNotification.model_validate(params_dict)
+            except Exception:  # noqa: BLE001
+                return Notification(method=method, payload=UnknownNotification(params=params_dict))
+            return Notification(method=method, payload=payload)
+
+        canonical_method = NOTIFICATION_METHOD_ALIASES.get(method, method)
+        model = NOTIFICATION_MODELS.get(canonical_method)
         if model is None:
             # Accept newer server notifications without breaking current SDK flows.
-            return Notification(method=method, payload=UnknownNotification(params=params_dict))
-        payload = model.model_validate(params_dict)
-        return Notification(method=method, payload=payload)
+            return Notification(method=canonical_method, payload=UnknownNotification(params=params_dict))
+
+        try:
+            payload = model.model_validate(params_dict)
+        except Exception:  # noqa: BLE001
+            return Notification(method=canonical_method, payload=UnknownNotification(params=params_dict))
+        return Notification(method=canonical_method, payload=payload)
 
     def _normalize_input_items(
         self, input_items: list[JsonObject] | JsonObject | str
