@@ -592,6 +592,8 @@ static PROCESS_GH_RETRY_CONFIG: OnceLock<GhRetryConfig> = OnceLock::new();
 enum ProcessSubcommand {
     /// Start a process-mode run and scaffold required artifacts.
     Run(ProcessRunArgs),
+    /// Execute a full process-mode pipeline and produce stage artifacts.
+    Execute(ProcessExecuteArgs),
     /// Inspect a process-mode run by id, or the latest run if omitted.
     Status(ProcessStatusArgs),
     /// Ingest open PR comments from GitHub and scaffold response planning artifacts.
@@ -606,6 +608,29 @@ struct ProcessRunArgs {
     /// Task description for this run.
     #[arg(long)]
     task: String,
+}
+
+#[derive(Debug, Args)]
+struct ProcessExecuteArgs {
+    /// Task description for this execution.
+    #[arg(long)]
+    task: String,
+
+    /// Plan the run without subprocess execution or verifier command execution.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Verification command to run in VERIFY stage (repeatable).
+    #[arg(long = "verify", value_name = "CMD", action = clap::ArgAction::Append)]
+    verify_commands: Vec<String>,
+
+    /// Optional sandbox mode for the GREEN codex subprocess.
+    #[arg(long = "sandbox", short = 's', value_enum)]
+    sandbox_mode: Option<codex_utils_cli::SandboxModeCliArg>,
+
+    /// Optional approval policy for the GREEN codex subprocess.
+    #[arg(long = "approval-policy", value_enum)]
+    approval_policy: Option<codex_utils_cli::ApprovalModeCliArg>,
 }
 
 #[derive(Debug, Args)]
@@ -961,6 +986,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 ProcessSubcommand::Run(args) => {
                     run_process_mode(args)?;
                 }
+                ProcessSubcommand::Execute(args) => {
+                    run_process_execute(args)?;
+                }
                 ProcessSubcommand::Status(args) => {
                     process_mode_status(args)?;
                 }
@@ -1089,6 +1117,505 @@ fn run_process_mode(args: ProcessRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProcessExecuteStageStatus {
+    Planned,
+    Success,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProcessExecuteFinalStatus {
+    Planned,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessExecuteStageOutcome {
+    stage: String,
+    status: ProcessExecuteStageStatus,
+    detail: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessExecuteVerifyCommandResult {
+    command: String,
+    success: bool,
+    status_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessExecuteRunReport {
+    run_id: String,
+    task: String,
+    dry_run: bool,
+    verify_commands: Vec<String>,
+    sandbox_mode: Option<String>,
+    approval_policy: Option<String>,
+    started_at: u64,
+    finished_at: u64,
+    final_status: ProcessExecuteFinalStatus,
+    stages: Vec<ProcessExecuteStageOutcome>,
+}
+
+fn process_execute_final_status(
+    stages: &[ProcessExecuteStageOutcome],
+) -> ProcessExecuteFinalStatus {
+    if stages
+        .iter()
+        .any(|stage| stage.status == ProcessExecuteStageStatus::Failed)
+    {
+        return ProcessExecuteFinalStatus::Failed;
+    }
+    if stages
+        .iter()
+        .any(|stage| stage.status == ProcessExecuteStageStatus::Success)
+    {
+        return ProcessExecuteFinalStatus::Success;
+    }
+    ProcessExecuteFinalStatus::Planned
+}
+
+fn process_execute_stage_label(status: ProcessExecuteStageStatus) -> &'static str {
+    match status {
+        ProcessExecuteStageStatus::Planned => "PLANNED",
+        ProcessExecuteStageStatus::Success => "SUCCESS",
+        ProcessExecuteStageStatus::Failed => "FAILED",
+        ProcessExecuteStageStatus::Skipped => "SKIPPED",
+    }
+}
+
+fn process_execute_final_label(status: ProcessExecuteFinalStatus) -> &'static str {
+    match status {
+        ProcessExecuteFinalStatus::Planned => "PLANNED",
+        ProcessExecuteFinalStatus::Success => "SUCCESS",
+        ProcessExecuteFinalStatus::Failed => "FAILED",
+    }
+}
+
+fn approval_policy_value(mode: codex_utils_cli::ApprovalModeCliArg) -> &'static str {
+    match mode {
+        codex_utils_cli::ApprovalModeCliArg::Untrusted => "untrusted",
+        codex_utils_cli::ApprovalModeCliArg::OnFailure => "on-failure",
+        codex_utils_cli::ApprovalModeCliArg::OnRequest => "on-request",
+        codex_utils_cli::ApprovalModeCliArg::Never => "never",
+    }
+}
+
+fn sandbox_mode_value(mode: codex_utils_cli::SandboxModeCliArg) -> &'static str {
+    match mode {
+        codex_utils_cli::SandboxModeCliArg::ReadOnly => "read-only",
+        codex_utils_cli::SandboxModeCliArg::WorkspaceWrite => "workspace-write",
+        codex_utils_cli::SandboxModeCliArg::DangerFullAccess => "danger-full-access",
+    }
+}
+
+fn write_process_execute_json(
+    run_dir: &std::path::Path,
+    file_name: &str,
+    value: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    std::fs::write(
+        run_dir.join(file_name),
+        serde_json::to_string_pretty(value)?,
+    )?;
+    Ok(())
+}
+
+fn run_process_execute_verify_command(command: &str) -> ProcessExecuteVerifyCommandResult {
+    #[cfg(windows)]
+    let output = std::process::Command::new("cmd")
+        .args(["/C", command])
+        .output();
+    #[cfg(not(windows))]
+    let output = std::process::Command::new("sh")
+        .args(["-lc", command])
+        .output();
+
+    match output {
+        Ok(output) => ProcessExecuteVerifyCommandResult {
+            command: command.to_string(),
+            success: output.status.success(),
+            status_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            error: None,
+        },
+        Err(err) => ProcessExecuteVerifyCommandResult {
+            command: command.to_string(),
+            success: false,
+            status_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn run_process_execute(args: ProcessExecuteArgs) -> anyhow::Result<()> {
+    let ProcessExecuteArgs {
+        task,
+        dry_run,
+        verify_commands,
+        sandbox_mode: sandbox_mode_arg,
+        approval_policy: approval_policy_arg,
+    } = args;
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let sandbox_mode = sandbox_mode_arg.map(sandbox_mode_value);
+    let approval_policy = approval_policy_arg.map(approval_policy_value);
+    let mut stage_outcomes = Vec::new();
+
+    let contract_payload = serde_json::json!({
+        "runId": run_id,
+        "stage": "CONTRACT",
+        "status": "written",
+        "task": task.clone(),
+        "scope": {
+            "inScope": ["TODO: define in-scope items"],
+            "outOfScope": ["TODO: define out-of-scope items"],
+            "constraints": ["TODO: define constraints"]
+        },
+        "notes": "Contract scaffold created by process execute."
+    });
+    match write_process_execute_json(&run_dir, "contract.json", &contract_payload) {
+        Ok(()) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "CONTRACT".to_string(),
+            status: ProcessExecuteStageStatus::Success,
+            detail: "contract.json written".to_string(),
+        }),
+        Err(err) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "CONTRACT".to_string(),
+            status: ProcessExecuteStageStatus::Failed,
+            detail: format!("contract.json write failed: {err}"),
+        }),
+    }
+
+    let red_payload = serde_json::json!({
+        "runId": run_id,
+        "stage": "RED",
+        "status": "recorded",
+        "intent": "Capture red-phase intent before implementation.",
+        "failingProofNote": "TODO: attach failing test output or reproducible failing proof."
+    });
+    match write_process_execute_json(&run_dir, "red-proof.json", &red_payload) {
+        Ok(()) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "RED".to_string(),
+            status: ProcessExecuteStageStatus::Success,
+            detail: "red-proof.json written".to_string(),
+        }),
+        Err(err) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "RED".to_string(),
+            status: ProcessExecuteStageStatus::Failed,
+            detail: format!("red-proof.json write failed: {err}"),
+        }),
+    }
+
+    let green_result = if dry_run {
+        serde_json::json!({
+            "runId": run_id,
+            "stage": "GREEN",
+            "dryRun": true,
+            "attempted": false,
+            "success": false,
+            "command": null,
+            "statusCode": null,
+            "stdout": "",
+            "stderr": "",
+            "error": null,
+            "note": "Dry run: skipped codex subprocess execution."
+        })
+    } else {
+        let mut command_args = vec!["exec".to_string(), "--skip-git-repo-check".to_string()];
+        if let Some(mode) = sandbox_mode {
+            command_args.push("--sandbox".to_string());
+            command_args.push(mode.to_string());
+        }
+        if let Some(policy) = approval_policy {
+            command_args.push("-c".to_string());
+            command_args.push(format!("permissions.approval_policy={policy}"));
+        }
+        let prompt = format!(
+            "Execute GREEN stage for process run {run_id}.\nTask: {task}\nImplement the requested changes and report concise completion details."
+        );
+        command_args.push(prompt);
+        match std::env::current_exe() {
+            Ok(executable) => match std::process::Command::new(executable)
+                .args(&command_args)
+                .output()
+            {
+                Ok(output) => serde_json::json!({
+                    "runId": run_id,
+                    "stage": "GREEN",
+                    "dryRun": false,
+                    "attempted": true,
+                    "success": output.status.success(),
+                    "command": command_args,
+                    "statusCode": output.status.code(),
+                    "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+                    "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+                    "error": serde_json::Value::Null
+                }),
+                Err(err) => serde_json::json!({
+                    "runId": run_id,
+                    "stage": "GREEN",
+                    "dryRun": false,
+                    "attempted": true,
+                    "success": false,
+                    "command": command_args,
+                    "statusCode": serde_json::Value::Null,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": format!("Failed to launch codex subprocess: {err}")
+                }),
+            },
+            Err(err) => serde_json::json!({
+                "runId": run_id,
+                "stage": "GREEN",
+                "dryRun": false,
+                "attempted": false,
+                "success": false,
+                "command": serde_json::Value::Null,
+                "statusCode": serde_json::Value::Null,
+                "stdout": "",
+                "stderr": "",
+                "error": format!("Failed to resolve current executable: {err}")
+            }),
+        }
+    };
+    let green_success = green_result
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let green_attempted = green_result
+        .get("attempted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match write_process_execute_json(&run_dir, "green.json", &green_result) {
+        Ok(()) => {
+            if dry_run {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "GREEN".to_string(),
+                    status: ProcessExecuteStageStatus::Planned,
+                    detail: "dry run: codex subprocess skipped".to_string(),
+                });
+            } else if green_success {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "GREEN".to_string(),
+                    status: ProcessExecuteStageStatus::Success,
+                    detail: "codex subprocess completed successfully".to_string(),
+                });
+            } else if green_attempted {
+                let detail = green_result
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("codex subprocess returned failure");
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "GREEN".to_string(),
+                    status: ProcessExecuteStageStatus::Failed,
+                    detail: detail.to_string(),
+                });
+            } else {
+                let detail = green_result
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("codex subprocess was not attempted");
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "GREEN".to_string(),
+                    status: ProcessExecuteStageStatus::Failed,
+                    detail: detail.to_string(),
+                });
+            }
+        }
+        Err(err) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "GREEN".to_string(),
+            status: ProcessExecuteStageStatus::Failed,
+            detail: format!("green.json write failed: {err}"),
+        }),
+    }
+
+    let verify_payload = if dry_run {
+        serde_json::json!({
+            "runId": run_id,
+            "stage": "VERIFY",
+            "dryRun": true,
+            "commands": verify_commands.clone(),
+            "results": [],
+            "allPassed": false,
+            "note": "Dry run: verification commands were not executed."
+        })
+    } else {
+        let results = verify_commands
+            .iter()
+            .map(|command| run_process_execute_verify_command(command))
+            .collect::<Vec<_>>();
+        let all_passed = !results.is_empty() && results.iter().all(|result| result.success);
+        serde_json::json!({
+            "runId": run_id,
+            "stage": "VERIFY",
+            "dryRun": false,
+            "commands": verify_commands.clone(),
+            "results": results,
+            "allPassed": all_passed,
+            "note": if results.is_empty() { "No verify commands were provided." } else { "" }
+        })
+    };
+    let verify_all_passed = verify_payload
+        .get("allPassed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let verify_has_commands = !verify_commands.is_empty();
+    match write_process_execute_json(&run_dir, "verify.json", &verify_payload) {
+        Ok(()) => {
+            if dry_run {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "VERIFY".to_string(),
+                    status: ProcessExecuteStageStatus::Planned,
+                    detail: "dry run: verify commands not executed".to_string(),
+                });
+            } else if !verify_has_commands {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "VERIFY".to_string(),
+                    status: ProcessExecuteStageStatus::Skipped,
+                    detail: "no verify commands provided".to_string(),
+                });
+            } else if verify_all_passed {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "VERIFY".to_string(),
+                    status: ProcessExecuteStageStatus::Success,
+                    detail: "all verify commands passed".to_string(),
+                });
+            } else {
+                stage_outcomes.push(ProcessExecuteStageOutcome {
+                    stage: "VERIFY".to_string(),
+                    status: ProcessExecuteStageStatus::Failed,
+                    detail: "one or more verify commands failed".to_string(),
+                });
+            }
+        }
+        Err(err) => stage_outcomes.push(ProcessExecuteStageOutcome {
+            stage: "VERIFY".to_string(),
+            status: ProcessExecuteStageStatus::Failed,
+            detail: format!("verify.json write failed: {err}"),
+        }),
+    }
+
+    let traceability_payload = serde_json::json!({
+        "runId": run_id,
+        "stage": "EVIDENCE",
+        "status": "scaffolded",
+        "traceability": [
+            {
+                "contractRequirement": "TODO",
+                "implementedIn": ["TODO"],
+                "verifiedBy": verify_commands.clone()
+            }
+        ],
+        "notes": "Populate mappings from requirements to code and verification evidence."
+    });
+    let traceability_write =
+        write_process_execute_json(&run_dir, "traceability.json", &traceability_payload);
+    let mut evidence_outcome = match traceability_write {
+        Ok(()) => ProcessExecuteStageOutcome {
+            stage: "EVIDENCE".to_string(),
+            status: ProcessExecuteStageStatus::Success,
+            detail: "traceability.json written".to_string(),
+        },
+        Err(err) => ProcessExecuteStageOutcome {
+            stage: "EVIDENCE".to_string(),
+            status: ProcessExecuteStageStatus::Failed,
+            detail: format!("traceability.json write failed: {err}"),
+        },
+    };
+    stage_outcomes.push(evidence_outcome.clone());
+
+    let final_status_for_summary = process_execute_final_status(&stage_outcomes);
+    let summary_lines = stage_outcomes
+        .iter()
+        .map(|outcome| {
+            let label = process_execute_stage_label(outcome.status);
+            format!(
+                "- {stage}: {label} ({detail})",
+                stage = outcome.stage,
+                detail = outcome.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sandbox_value = sandbox_mode.unwrap_or("default");
+    let approval_value = approval_policy.unwrap_or("default");
+    let final_status_label = process_execute_final_label(final_status_for_summary);
+    let summary = format!(
+        "# Process Execute Run {run_id}\n\n- task: {task}\n- dryRun: {dry_run}\n- sandbox: {sandbox_value}\n- approvalPolicy: {approval_value}\n- finalStatus: {final_status_label}\n\n## Stage Outcomes\n{summary_lines}\n",
+    );
+    if let Err(err) = std::fs::write(run_dir.join("summary.md"), summary) {
+        evidence_outcome.status = ProcessExecuteStageStatus::Failed;
+        evidence_outcome.detail = format!("summary.md write failed: {err}");
+        if let Some(last) = stage_outcomes.last_mut() {
+            last.status = evidence_outcome.status;
+            last.detail = evidence_outcome.detail.clone();
+        }
+    } else if evidence_outcome.status == ProcessExecuteStageStatus::Success
+        && let Some(last) = stage_outcomes.last_mut()
+    {
+        last.detail = "traceability.json and summary.md written".to_string();
+    }
+
+    let finished_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let final_status = process_execute_final_status(&stage_outcomes);
+    let execute_report = ProcessExecuteRunReport {
+        run_id: run_id.clone(),
+        task: task.clone(),
+        dry_run,
+        verify_commands: verify_commands.clone(),
+        sandbox_mode: sandbox_mode.map(ToString::to_string),
+        approval_policy: approval_policy.map(ToString::to_string),
+        started_at,
+        finished_at,
+        final_status,
+        stages: stage_outcomes.clone(),
+    };
+    let execute_write = write_process_execute_json(&run_dir, "execute.json", &execute_report);
+    if let Err(err) = execute_write {
+        eprintln!("Warning: failed to write execute.json: {err}");
+    }
+
+    println!("Process execute run: {run_id}");
+    println!("Artifacts: {}", run_dir.display());
+    for stage in &stage_outcomes {
+        let status_label = process_execute_stage_label(stage.status);
+        println!(
+            "- {stage_name}: {status_label} ({detail})",
+            stage_name = stage.stage,
+            detail = stage.detail
+        );
+    }
+    let final_status_label = process_execute_final_label(final_status);
+    println!("Final status: {final_status_label}");
+
+    Ok(())
+}
+
 fn process_mode_status(args: ProcessStatusArgs) -> anyhow::Result<()> {
     let runs_dir = std::path::PathBuf::from(".process/runs");
     let run_id = if let Some(run_id) = args.run_id {
@@ -1115,9 +1642,11 @@ fn process_mode_status(args: ProcessStatusArgs) -> anyhow::Result<()> {
     for name in [
         "contract.json",
         "red-proof.json",
+        "green.json",
         "verify.json",
         "traceability.json",
         "summary.md",
+        "execute.json",
     ] {
         let path = run_dir.join(name);
         let status = if path.exists() { "present" } else { "missing" };
@@ -5309,6 +5838,57 @@ mod tests {
     }
 
     #[test]
+    fn process_execute_parses_task_and_options() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "execute",
+            "--task",
+            "Implement process pipeline",
+            "--dry-run",
+            "--verify",
+            "cargo test -p codex-cli",
+            "--verify",
+            "cargo test -p codex-core",
+            "--sandbox",
+            "workspace-write",
+            "--approval-policy",
+            "never",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Execute(ProcessExecuteArgs {
+            task,
+            dry_run,
+            verify_commands,
+            sandbox_mode,
+            approval_policy,
+        }) = sub
+        else {
+            panic!("expected process execute");
+        };
+        assert_eq!(task, "Implement process pipeline");
+        assert!(dry_run);
+        assert_eq!(
+            verify_commands,
+            vec![
+                "cargo test -p codex-cli".to_string(),
+                "cargo test -p codex-core".to_string(),
+            ]
+        );
+        assert!(matches!(
+            sandbox_mode,
+            Some(codex_utils_cli::SandboxModeCliArg::WorkspaceWrite)
+        ));
+        assert!(matches!(
+            approval_policy,
+            Some(codex_utils_cli::ApprovalModeCliArg::Never)
+        ));
+    }
+
+    #[test]
     fn process_pr_comments_parses_target() {
         let cli = MultitoolCli::try_parse_from([
             "codex",
@@ -5970,6 +6550,57 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn process_execute_final_status_is_failed_when_any_stage_fails() {
+        let status = process_execute_final_status(&[
+            ProcessExecuteStageOutcome {
+                stage: "CONTRACT".to_string(),
+                status: ProcessExecuteStageStatus::Success,
+                detail: "ok".to_string(),
+            },
+            ProcessExecuteStageOutcome {
+                stage: "GREEN".to_string(),
+                status: ProcessExecuteStageStatus::Failed,
+                detail: "subprocess failed".to_string(),
+            },
+        ]);
+        assert_eq!(status, ProcessExecuteFinalStatus::Failed);
+    }
+
+    #[test]
+    fn process_execute_final_status_is_success_when_no_failures_and_some_success() {
+        let status = process_execute_final_status(&[
+            ProcessExecuteStageOutcome {
+                stage: "CONTRACT".to_string(),
+                status: ProcessExecuteStageStatus::Success,
+                detail: "ok".to_string(),
+            },
+            ProcessExecuteStageOutcome {
+                stage: "VERIFY".to_string(),
+                status: ProcessExecuteStageStatus::Skipped,
+                detail: "none".to_string(),
+            },
+        ]);
+        assert_eq!(status, ProcessExecuteFinalStatus::Success);
+    }
+
+    #[test]
+    fn process_execute_final_status_is_planned_when_no_stage_succeeds() {
+        let status = process_execute_final_status(&[
+            ProcessExecuteStageOutcome {
+                stage: "GREEN".to_string(),
+                status: ProcessExecuteStageStatus::Planned,
+                detail: "dry run".to_string(),
+            },
+            ProcessExecuteStageOutcome {
+                stage: "VERIFY".to_string(),
+                status: ProcessExecuteStageStatus::Planned,
+                detail: "dry run".to_string(),
+            },
+        ]);
+        assert_eq!(status, ProcessExecuteFinalStatus::Planned);
     }
 
     #[test]

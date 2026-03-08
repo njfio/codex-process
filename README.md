@@ -57,6 +57,10 @@ This fork now ships a renamed primary CLI binary: **`nickdex`**.
 
 ```shell
 nickdex process run --task "Implement X"
+nickdex process execute --task "Implement X"
+nickdex process execute --task "Implement X" --dry-run
+nickdex process execute --task "Implement X" --verify "cargo test -p codex-cli" --verify "cargo test -p codex-core"
+nickdex process execute --task "Implement X" --sandbox workspace-write --approval-policy never
 nickdex process status --run-id <id>
 nickdex process pr-comments --repo owner/repo --pr 123
 nickdex process pr-comments --repo owner/repo --pr 123 --act
@@ -72,7 +76,17 @@ nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 
 nickdex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act --max-concurrency 3 --queue-delay-ms 400 --max-act-items 10
 ```
 
-The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
+`process execute` now runs an end-to-end stage pipeline and writes machine-readable artifacts under `.process/runs/<run-id>/`:
+`contract.json`, `red-proof.json`, `green.json`, `verify.json`, `traceability.json`, `summary.md`, and `execute.json`.
+It automates:
+- CONTRACT stage scaffolding with task + scope placeholders.
+- RED stage intent recording with a failing-proof placeholder.
+- GREEN stage Codex subprocess execution (`codex exec`) unless `--dry-run`.
+- VERIFY stage execution of each `--verify` command (when provided) with per-command stdout/stderr pass/fail capture.
+- EVIDENCE stage summary + traceability scaffold generation.
+Stage failures are recorded in `execute.json` and printed to the console; the run continues through all stages so a final report is always produced.
+
+`process run` remains available as the lightweight scaffolding command.
 The `pr-comments` subcommand performs live GitHub comment ingestion via `gh`, capturing unresolved PR review comments (including `reviewThreadId`) and issue comments into `.process/runs/<run-id>/pr-comments.json`.
 Passing `--act` enables triage and follow-up automation: comments are classified (`quick_fix`, `needs_issue`, `question`) and written to `.process/runs/<run-id>/triage.json`.
 Passing `--act --dry-run` performs the same ingestion + triage planning flow but skips all external mutations (no Codex subprocesses, no branch/commit/push/PR operations, and no GitHub comment/thread/issue updates).
