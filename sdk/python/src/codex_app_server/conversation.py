@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterator
+from typing import TYPE_CHECKING, AsyncIterator, Iterator
 
 from .generated.v2_all.AgentMessageDeltaNotification import AgentMessageDeltaNotification
 from .generated.v2_all.TurnCompletedNotification import TurnCompletedNotification
@@ -10,7 +10,7 @@ from .generated.v2_all.TurnStartResponse import TurnStartResponse
 from .generated.v2_all.TurnSteerResponse import TurnSteerResponse
 from .models import JsonObject, Notification, TextTurnResult
 
-if False:  # pragma: no cover
+if TYPE_CHECKING:
     from .async_client import AsyncAppServerClient
     from .client import AppServerClient
 

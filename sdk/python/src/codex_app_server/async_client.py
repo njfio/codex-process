@@ -44,7 +44,7 @@ class AsyncAppServerClient:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, _exc_type, _exc, _tb) -> None:
         await self.close()
 
     async def _call_sync(
