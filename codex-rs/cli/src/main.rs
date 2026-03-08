@@ -628,6 +628,10 @@ struct ProcessPrCommentsArgs {
     /// Triage comments and create follow-up issues for deferred work.
     #[arg(long, default_value_t = false)]
     act: bool,
+
+    /// Plan `--act` operations without mutating git or GitHub.
+    #[arg(long, default_value_t = false, requires = "act")]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -659,6 +663,10 @@ struct ProcessIssuesWatchArgs {
     /// Triage matching issues and attempt targeted quick-fix automation.
     #[arg(long, default_value_t = false)]
     act: bool,
+
+    /// Plan `--act` operations without mutating git or GitHub.
+    #[arg(long, default_value_t = false, requires = "act")]
+    dry_run: bool,
 
     /// Maximum number of issues to process concurrently in `--act` mode.
     #[arg(long, default_value_t = DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY)]
@@ -1140,34 +1148,39 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     let mut triage_items = payload
         .unresolved_review_comments
         .iter()
-        .map(|comment| ProcessCommentTriageItem {
-            source: "review_comment".to_string(),
-            comment_id: comment.id.clone(),
-            review_thread_id: comment.review_thread_id.clone(),
-            author: comment.author.clone(),
-            body: comment.body.clone(),
-            comment_url: comment.url.clone(),
-            decision: classify_comment_triage(&comment.body),
-            created_issue_url: None,
-            todo: None,
-            quick_fix_attempted: false,
-            quick_fix_success: None,
-            quick_fix_summary: None,
-            quick_fix_error: None,
-            quick_fix_branch: None,
-            quick_fix_commit_sha: None,
-            quick_fix_commit_url: None,
-            quick_fix_pushed: None,
-            quick_fix_remote_branch: None,
-            quick_fix_pr_url: None,
-            quick_fix_pr_number: None,
-            quick_fix_push_error: None,
-            quick_fix_pr_error: None,
-            quick_fix_thread_resolved: None,
-            quick_fix_thread_resolve_error: None,
+        .map(|comment| {
+            let decision = classify_comment_triage(&comment.body);
+            ProcessCommentTriageItem {
+                source: "review_comment".to_string(),
+                comment_id: comment.id.clone(),
+                review_thread_id: comment.review_thread_id.clone(),
+                author: comment.author.clone(),
+                body: comment.body.clone(),
+                comment_url: comment.url.clone(),
+                decision,
+                planned_action: format_pr_comments_planned_action(decision, args.dry_run),
+                created_issue_url: None,
+                todo: None,
+                quick_fix_attempted: false,
+                quick_fix_success: None,
+                quick_fix_summary: None,
+                quick_fix_error: None,
+                quick_fix_branch: None,
+                quick_fix_commit_sha: None,
+                quick_fix_commit_url: None,
+                quick_fix_pushed: None,
+                quick_fix_remote_branch: None,
+                quick_fix_pr_url: None,
+                quick_fix_pr_number: None,
+                quick_fix_push_error: None,
+                quick_fix_pr_error: None,
+                quick_fix_thread_resolved: None,
+                quick_fix_thread_resolve_error: None,
+            }
         })
         .collect::<Vec<_>>();
     triage_items.extend(payload.open_issue_comments.iter().map(|comment| {
+        let decision = classify_comment_triage(&comment.body);
         ProcessCommentTriageItem {
             source: "issue_comment".to_string(),
             comment_id: comment.id.clone(),
@@ -1175,7 +1188,8 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             author: comment.author.clone(),
             body: comment.body.clone(),
             comment_url: comment.url.clone(),
-            decision: classify_comment_triage(&comment.body),
+            decision,
+            planned_action: format_pr_comments_planned_action(decision, args.dry_run),
             created_issue_url: None,
             todo: None,
             quick_fix_attempted: false,
@@ -1200,29 +1214,42 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     let mut created_issues = Vec::new();
     let mut successful_quick_fixes = Vec::new();
     let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
-    let quick_fix_root_error = std::fs::create_dir_all(&quick_fix_worktree_root)
-        .err()
-        .map(|err| {
-            format!(
-                "Unable to prepare quick-fix worktree directory {}: {err}",
-                quick_fix_worktree_root.display()
-            )
-        });
-    let quick_fix_base_sha = current_git_head_sha();
-    let quick_fix_pr_base_branch = match fetch_pr_base_branch_name(&args.repo, args.pr) {
-        Ok(branch) => branch,
-        Err(err) => {
-            eprintln!(
-                "Warning: unable to determine source PR base branch for #{pr}: {err}; defaulting to `main` for follow-up PRs.",
-                pr = args.pr
-            );
-            None
-        }
+    let (quick_fix_root_error, quick_fix_base_sha, quick_fix_pr_base_branch) = if args.dry_run {
+        (None, Ok(String::new()), None)
+    } else {
+        let quick_fix_root_error =
+            std::fs::create_dir_all(&quick_fix_worktree_root)
+                .err()
+                .map(|err| {
+                    format!(
+                        "Unable to prepare quick-fix worktree directory {}: {err}",
+                        quick_fix_worktree_root.display()
+                    )
+                });
+        let quick_fix_base_sha = current_git_head_sha();
+        let quick_fix_pr_base_branch = match fetch_pr_base_branch_name(&args.repo, args.pr) {
+            Ok(branch) => branch,
+            Err(err) => {
+                eprintln!(
+                    "Warning: unable to determine source PR base branch for #{pr}: {err}; defaulting to `main` for follow-up PRs.",
+                    pr = args.pr
+                );
+                None
+            }
+        };
+        (
+            quick_fix_root_error,
+            quick_fix_base_sha,
+            quick_fix_pr_base_branch,
+        )
     };
     for item in &mut triage_items {
         match item.decision {
             TriageDecision::QuickFix => {
                 grouped_by_decision.quick_fix += 1;
+                if args.dry_run {
+                    continue;
+                }
                 let execution = if let Some(err) = &quick_fix_root_error {
                     QuickFixExecutionResult {
                         attempted: false,
@@ -1338,6 +1365,9 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             }
             TriageDecision::NeedsIssue => {
                 grouped_by_decision.needs_issue += 1;
+                if args.dry_run {
+                    continue;
+                }
                 let issue_url = create_follow_up_issue(
                     &args.repo,
                     args.pr,
@@ -1357,13 +1387,14 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
             }
         }
     }
-    let pr_update_comment_url = if successful_quick_fixes.is_empty() {
+    let pr_update_comment_url = if args.dry_run || successful_quick_fixes.is_empty() {
         None
     } else {
         post_quick_fix_pr_update_comment(&args.repo, args.pr, &successful_quick_fixes)?
     };
 
     let triage_artifact = ProcessPrCommentsTriageArtifact {
+        dry_run: args.dry_run,
         repo: args.repo.clone(),
         pr: args.pr,
         fetched_at: payload.fetched_at,
@@ -1386,6 +1417,11 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
         triage_artifact.grouped_by_decision.needs_issue,
         triage_artifact.grouped_by_decision.question
     );
+    if args.dry_run {
+        println!(
+            "Dry run: no external mutations were performed (no codex subprocesses, git writes, or GitHub updates)."
+        );
+    }
     println!("Artifact: {}", run_dir.join("triage.json").display());
     if created_issues.is_empty() {
         println!("Created issue URLs: none");
@@ -1460,6 +1496,7 @@ struct ProcessCommentTriageItem {
     body: String,
     comment_url: String,
     decision: TriageDecision,
+    planned_action: String,
     created_issue_url: Option<String>,
     todo: Option<String>,
     quick_fix_attempted: bool,
@@ -1498,6 +1535,7 @@ struct ProcessCreatedIssue {
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessPrCommentsTriageArtifact {
+    dry_run: bool,
     repo: String,
     pr: u64,
     fetched_at: u64,
@@ -1587,6 +1625,7 @@ struct ProcessIssuesWatchActIssueAction {
     issue_number: u64,
     issue_url: String,
     decision: IssueWatchDecision,
+    planned_action: String,
     skipped_reason: Option<IssueWatchSkippedReason>,
     attempted: bool,
     success: bool,
@@ -1602,6 +1641,7 @@ struct ProcessIssuesWatchActIssueAction {
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessIssuesWatchActArtifact {
+    dry_run: bool,
     fetched_at: u64,
     repo: String,
     label: String,
@@ -1852,39 +1892,20 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
     if args.act {
         let max_act_items = args.max_act_items.map(|value| value as usize);
         let queue_plan = build_process_issues_watch_act_queue_plan(issues.len(), max_act_items);
-        let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
-        let quick_fix_root_error =
-            std::fs::create_dir_all(&quick_fix_worktree_root)
-                .err()
-                .map(|err| {
-                    format!(
-                        "Unable to prepare quick-fix worktree directory {}: {err}",
-                        quick_fix_worktree_root.display()
-                    )
-                });
-        let (quick_fix_base_sha, quick_fix_base_sha_error) = match current_git_head_sha() {
-            Ok(value) => (Some(value), None),
-            Err(err) => (None, Some(err.to_string())),
-        };
-        let quick_fix_pr_base_branch = match fetch_repo_default_branch_name(&args.repo) {
-            Ok(Some(branch)) => branch,
-            Ok(None) => "main".to_string(),
-            Err(err) => {
-                eprintln!(
-                    "Warning: unable to determine default branch for {}: {err}; using `main` for follow-up PRs.",
-                    args.repo
-                );
-                "main".to_string()
-            }
-        };
 
         let mut issue_actions = vec![None; issues.len()];
         for skipped in &queue_plan.skipped {
             let issue = &issues[skipped.issue_index];
+            let decision = classify_issue_watch_triage(issue);
             issue_actions[skipped.issue_index] = Some(ProcessIssuesWatchActIssueAction {
                 issue_number: issue.number,
                 issue_url: issue.url.clone(),
-                decision: classify_issue_watch_triage(issue),
+                decision,
+                planned_action: format_issues_watch_planned_action(
+                    decision,
+                    Some(skipped.reason),
+                    args.dry_run,
+                ),
                 skipped_reason: Some(skipped.reason),
                 attempted: false,
                 success: false,
@@ -1898,199 +1919,153 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             });
         }
 
-        let act_queue = queue_plan
-            .acted_indices
-            .iter()
-            .map(|&index| (index, issues[index].clone()))
-            .collect::<std::collections::VecDeque<_>>();
-        let total_to_act = act_queue.len();
-        if !act_queue.is_empty() {
-            let worker_count = args.max_concurrency.min(16).min(total_to_act).max(1);
-            let queue = std::sync::Arc::new(std::sync::Mutex::new(act_queue));
-            let queue_remaining =
-                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total_to_act));
-            let active_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let next_start_at =
-                std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-            let queue_delay = std::time::Duration::from_millis(args.queue_delay_ms);
-            let (result_tx, result_rx) =
-                std::sync::mpsc::channel::<(usize, ProcessIssuesWatchActIssueAction)>();
+        if args.dry_run {
+            for &issue_index in &queue_plan.acted_indices {
+                let issue = &issues[issue_index];
+                let decision = classify_issue_watch_triage(issue);
+                issue_actions[issue_index] = Some(ProcessIssuesWatchActIssueAction {
+                    issue_number: issue.number,
+                    issue_url: issue.url.clone(),
+                    decision,
+                    planned_action: format_issues_watch_planned_action(decision, None, true),
+                    skipped_reason: None,
+                    attempted: false,
+                    success: false,
+                    branch: None,
+                    commit_sha: None,
+                    commit_url: None,
+                    pr_url: None,
+                    pr_number: None,
+                    update_comment_url: None,
+                    error: None,
+                });
+            }
+        } else {
+            let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
+            let quick_fix_root_error =
+                std::fs::create_dir_all(&quick_fix_worktree_root)
+                    .err()
+                    .map(|err| {
+                        format!(
+                            "Unable to prepare quick-fix worktree directory {}: {err}",
+                            quick_fix_worktree_root.display()
+                        )
+                    });
+            let (quick_fix_base_sha, quick_fix_base_sha_error) = match current_git_head_sha() {
+                Ok(value) => (Some(value), None),
+                Err(err) => (None, Some(err.to_string())),
+            };
+            let quick_fix_pr_base_branch = match fetch_repo_default_branch_name(&args.repo) {
+                Ok(Some(branch)) => branch,
+                Ok(None) => "main".to_string(),
+                Err(err) => {
+                    eprintln!(
+                        "Warning: unable to determine default branch for {}: {err}; using `main` for follow-up PRs.",
+                        args.repo
+                    );
+                    "main".to_string()
+                }
+            };
+            let act_queue = queue_plan
+                .acted_indices
+                .iter()
+                .map(|&index| (index, issues[index].clone()))
+                .collect::<std::collections::VecDeque<_>>();
+            let total_to_act = act_queue.len();
+            if !act_queue.is_empty() {
+                let worker_count = args.max_concurrency.min(16).min(total_to_act).max(1);
+                let queue = std::sync::Arc::new(std::sync::Mutex::new(act_queue));
+                let queue_remaining =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total_to_act));
+                let active_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let next_start_at =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+                let queue_delay = std::time::Duration::from_millis(args.queue_delay_ms);
+                let (result_tx, result_rx) =
+                    std::sync::mpsc::channel::<(usize, ProcessIssuesWatchActIssueAction)>();
 
-            std::thread::scope(|scope| {
-                for _ in 0..worker_count {
-                    let queue = std::sync::Arc::clone(&queue);
-                    let queue_remaining = std::sync::Arc::clone(&queue_remaining);
-                    let active_count = std::sync::Arc::clone(&active_count);
-                    let next_start_at = std::sync::Arc::clone(&next_start_at);
-                    let result_tx = result_tx.clone();
-                    let repo = args.repo.clone();
-                    let run_id = run_id.clone();
-                    let quick_fix_worktree_root = quick_fix_worktree_root.clone();
-                    let quick_fix_root_error = quick_fix_root_error.clone();
-                    let quick_fix_base_sha = quick_fix_base_sha.clone();
-                    let quick_fix_base_sha_error = quick_fix_base_sha_error.clone();
-                    let quick_fix_pr_base_branch = quick_fix_pr_base_branch.clone();
+                std::thread::scope(|scope| {
+                    for _ in 0..worker_count {
+                        let queue = std::sync::Arc::clone(&queue);
+                        let queue_remaining = std::sync::Arc::clone(&queue_remaining);
+                        let active_count = std::sync::Arc::clone(&active_count);
+                        let next_start_at = std::sync::Arc::clone(&next_start_at);
+                        let result_tx = result_tx.clone();
+                        let repo = args.repo.clone();
+                        let run_id = run_id.clone();
+                        let quick_fix_worktree_root = quick_fix_worktree_root.clone();
+                        let quick_fix_root_error = quick_fix_root_error.clone();
+                        let quick_fix_base_sha = quick_fix_base_sha.clone();
+                        let quick_fix_base_sha_error = quick_fix_base_sha_error.clone();
+                        let quick_fix_pr_base_branch = quick_fix_pr_base_branch.clone();
 
-                    scope.spawn(move || loop {
-                        let maybe_work = {
-                            let mut queue_guard = match queue.lock() {
-                                Ok(guard) => guard,
-                                Err(poison) => poison.into_inner(),
-                            };
-                            queue_guard.pop_front()
-                        };
-                        let Some((issue_index, issue)) = maybe_work else {
-                            break;
-                        };
-
-                        let sleep_for = {
-                            let mut gate = match next_start_at.lock() {
-                                Ok(guard) => guard,
-                                Err(poison) => poison.into_inner(),
-                            };
-                            let now = std::time::Instant::now();
-                            let wait = gate.saturating_duration_since(now);
-                            let start_at = now + wait;
-                            *gate = start_at + queue_delay;
-                            wait
-                        };
-                        if !sleep_for.is_zero() {
-                            std::thread::sleep(sleep_for);
-                        }
-
-                        let queue_remaining_after_start = queue_remaining
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-                            .saturating_sub(1);
-                        let active_after_start =
-                            active_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        eprintln!(
-                            "[issues-watch --act] start issue #{} (active={}, queue_remaining={})",
-                            issue.number, active_after_start, queue_remaining_after_start
-                        );
-
-                        let decision = classify_issue_watch_triage(&issue);
-                        let mut action = ProcessIssuesWatchActIssueAction {
-                            issue_number: issue.number,
-                            issue_url: issue.url.clone(),
-                            decision,
-                            skipped_reason: None,
-                            attempted: false,
-                            success: false,
-                            branch: None,
-                            commit_sha: None,
-                            commit_url: None,
-                            pr_url: None,
-                            pr_number: None,
-                            update_comment_url: None,
-                            error: None,
-                        };
-
-                        match decision {
-                            IssueWatchDecision::NeedsManual => {
-                                let reason = "Triaged as needs_manual for human follow-up (scope or risk is non-trivial).";
-                                let body = format_issue_watch_manual_follow_up_comment(reason);
-                                match post_issue_watch_update_comment(&repo, issue.number, &body) {
-                                    Ok(comment_url) => {
-                                        action.update_comment_url = comment_url;
-                                        action.error = Some(reason.to_string());
-                                    }
-                                    Err(err) => {
-                                        action.error = Some(format!(
-                                            "{reason} Failed to post issue update comment: {err}"
-                                        ));
-                                    }
-                                }
-                            }
-                            IssueWatchDecision::QuickFix => {
-                                let execution = if let Some(err) = &quick_fix_root_error {
-                                    QuickFixExecutionResult {
-                                        attempted: false,
-                                        success: false,
-                                        summary: None,
-                                        error: Some(err.clone()),
-                                        files: Vec::new(),
-                                        verification: None,
-                                        branch_name: None,
-                                        commit_sha: None,
-                                        commit_url: None,
-                                        pushed: None,
-                                        remote_branch: None,
-                                        follow_up_pr_url: None,
-                                        follow_up_pr_number: None,
-                                        push_error: None,
-                                        pr_error: None,
-                                    }
-                                } else if let Some(base_sha) = &quick_fix_base_sha {
-                                    run_issue_watch_quick_fix_in_isolated_branch(
-                                        &repo,
-                                        &issue,
-                                        base_sha,
-                                        &quick_fix_worktree_root,
-                                        &run_id,
-                                        &quick_fix_pr_base_branch,
-                                    )
-                                } else {
-                                    QuickFixExecutionResult {
-                                        attempted: false,
-                                        success: false,
-                                        summary: None,
-                                        error: Some(format!(
-                                            "Unable to read current git HEAD for quick-fix branching: {}",
-                                            quick_fix_base_sha_error
-                                                .clone()
-                                                .unwrap_or_else(|| "unknown error".to_string())
-                                        )),
-                                        files: Vec::new(),
-                                        verification: None,
-                                        branch_name: None,
-                                        commit_sha: None,
-                                        commit_url: None,
-                                        pushed: None,
-                                        remote_branch: None,
-                                        follow_up_pr_url: None,
-                                        follow_up_pr_number: None,
-                                        push_error: None,
-                                        pr_error: None,
-                                    }
+                        scope.spawn(move || loop {
+                            let maybe_work = {
+                                let mut queue_guard = match queue.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poison) => poison.into_inner(),
                                 };
+                                queue_guard.pop_front()
+                            };
+                            let Some((issue_index, issue)) = maybe_work else {
+                                break;
+                            };
 
-                                action.attempted = execution.attempted;
-                                action.success = execution.success;
-                                action.branch = execution.branch_name.clone();
-                                action.commit_sha = execution.commit_sha.clone();
-                                action.commit_url = execution.commit_url.clone();
-                                action.pr_url = execution.follow_up_pr_url.clone();
-                                action.pr_number = execution.follow_up_pr_number;
-                                action.error = execution.error.clone();
+                            let sleep_for = {
+                                let mut gate = match next_start_at.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poison) => poison.into_inner(),
+                                };
+                                let now = std::time::Instant::now();
+                                let wait = gate.saturating_duration_since(now);
+                                let start_at = now + wait;
+                                *gate = start_at + queue_delay;
+                                wait
+                            };
+                            if !sleep_for.is_zero() {
+                                std::thread::sleep(sleep_for);
+                            }
 
-                                if execution.success {
-                                    let body = format_issue_watch_success_comment(
-                                        execution.summary.as_deref(),
-                                        execution.follow_up_pr_url.as_deref(),
-                                        execution.follow_up_pr_number,
-                                        execution.commit_url.as_deref(),
-                                    );
-                                    match post_issue_watch_update_comment(&repo, issue.number, &body)
-                                    {
-                                        Ok(comment_url) => {
-                                            action.update_comment_url = comment_url;
-                                        }
-                                        Err(err) => {
-                                            action.error = Some(format!(
-                                                "Quick fix completed, but failed to post issue update comment: {err}"
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    let reason = action
-                                        .error
-                                        .as_deref()
-                                        .unwrap_or("Quick-fix attempt failed for an unknown reason.");
+                            let queue_remaining_after_start = queue_remaining
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                                .saturating_sub(1);
+                            let active_after_start =
+                                active_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                            eprintln!(
+                                "[issues-watch --act] start issue #{} (active={}, queue_remaining={})",
+                                issue.number, active_after_start, queue_remaining_after_start
+                            );
+
+                            let decision = classify_issue_watch_triage(&issue);
+                            let mut action = ProcessIssuesWatchActIssueAction {
+                                issue_number: issue.number,
+                                issue_url: issue.url.clone(),
+                                decision,
+                                planned_action: format_issues_watch_planned_action(
+                                    decision, None, false,
+                                ),
+                                skipped_reason: None,
+                                attempted: false,
+                                success: false,
+                                branch: None,
+                                commit_sha: None,
+                                commit_url: None,
+                                pr_url: None,
+                                pr_number: None,
+                                update_comment_url: None,
+                                error: None,
+                            };
+
+                            match decision {
+                                IssueWatchDecision::NeedsManual => {
+                                    let reason = "Triaged as needs_manual for human follow-up (scope or risk is non-trivial).";
                                     let body = format_issue_watch_manual_follow_up_comment(reason);
                                     match post_issue_watch_update_comment(&repo, issue.number, &body)
                                     {
                                         Ok(comment_url) => {
                                             action.update_comment_url = comment_url;
+                                            action.error = Some(reason.to_string());
                                         }
                                         Err(err) => {
                                             action.error = Some(format!(
@@ -2099,35 +2074,142 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
                                         }
                                     }
                                 }
+                                IssueWatchDecision::QuickFix => {
+                                    let execution = if let Some(err) = &quick_fix_root_error {
+                                        QuickFixExecutionResult {
+                                            attempted: false,
+                                            success: false,
+                                            summary: None,
+                                            error: Some(err.clone()),
+                                            files: Vec::new(),
+                                            verification: None,
+                                            branch_name: None,
+                                            commit_sha: None,
+                                            commit_url: None,
+                                            pushed: None,
+                                            remote_branch: None,
+                                            follow_up_pr_url: None,
+                                            follow_up_pr_number: None,
+                                            push_error: None,
+                                            pr_error: None,
+                                        }
+                                    } else if let Some(base_sha) = &quick_fix_base_sha {
+                                        run_issue_watch_quick_fix_in_isolated_branch(
+                                            &repo,
+                                            &issue,
+                                            base_sha,
+                                            &quick_fix_worktree_root,
+                                            &run_id,
+                                            &quick_fix_pr_base_branch,
+                                        )
+                                    } else {
+                                        QuickFixExecutionResult {
+                                            attempted: false,
+                                            success: false,
+                                            summary: None,
+                                            error: Some(format!(
+                                                "Unable to read current git HEAD for quick-fix branching: {}",
+                                                quick_fix_base_sha_error
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unknown error".to_string())
+                                            )),
+                                            files: Vec::new(),
+                                            verification: None,
+                                            branch_name: None,
+                                            commit_sha: None,
+                                            commit_url: None,
+                                            pushed: None,
+                                            remote_branch: None,
+                                            follow_up_pr_url: None,
+                                            follow_up_pr_number: None,
+                                            push_error: None,
+                                            pr_error: None,
+                                        }
+                                    };
+
+                                    action.attempted = execution.attempted;
+                                    action.success = execution.success;
+                                    action.branch = execution.branch_name.clone();
+                                    action.commit_sha = execution.commit_sha.clone();
+                                    action.commit_url = execution.commit_url.clone();
+                                    action.pr_url = execution.follow_up_pr_url.clone();
+                                    action.pr_number = execution.follow_up_pr_number;
+                                    action.error = execution.error.clone();
+
+                                    if execution.success {
+                                        let body = format_issue_watch_success_comment(
+                                            execution.summary.as_deref(),
+                                            execution.follow_up_pr_url.as_deref(),
+                                            execution.follow_up_pr_number,
+                                            execution.commit_url.as_deref(),
+                                        );
+                                        match post_issue_watch_update_comment(
+                                            &repo,
+                                            issue.number,
+                                            &body,
+                                        ) {
+                                            Ok(comment_url) => {
+                                                action.update_comment_url = comment_url;
+                                            }
+                                            Err(err) => {
+                                                action.error = Some(format!(
+                                                    "Quick fix completed, but failed to post issue update comment: {err}"
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        let reason = action.error.as_deref().unwrap_or(
+                                            "Quick-fix attempt failed for an unknown reason.",
+                                        );
+                                        let body = format_issue_watch_manual_follow_up_comment(
+                                            reason,
+                                        );
+                                        match post_issue_watch_update_comment(
+                                            &repo,
+                                            issue.number,
+                                            &body,
+                                        ) {
+                                            Ok(comment_url) => {
+                                                action.update_comment_url = comment_url;
+                                            }
+                                            Err(err) => {
+                                                action.error = Some(format!(
+                                                    "{reason} Failed to post issue update comment: {err}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
 
-                        let active_after_finish = active_count
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-                            .saturating_sub(1);
-                        let queue_remaining_now =
-                            queue_remaining.load(std::sync::atomic::Ordering::Relaxed);
-                        eprintln!(
-                            "[issues-watch --act] done issue #{} success={} attempted={} (active={}, queue_remaining={})",
-                            issue.number,
-                            action.success,
-                            action.attempted,
-                            active_after_finish,
-                            queue_remaining_now
-                        );
+                            let active_after_finish = active_count
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                                .saturating_sub(1);
+                            let queue_remaining_now =
+                                queue_remaining.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "[issues-watch --act] done issue #{} success={} attempted={} (active={}, queue_remaining={})",
+                                issue.number,
+                                action.success,
+                                action.attempted,
+                                active_after_finish,
+                                queue_remaining_now
+                            );
 
-                        let _ = result_tx.send((issue_index, action));
-                    });
-                }
-                drop(result_tx);
-                for (issue_index, action) in result_rx {
-                    issue_actions[issue_index] = Some(action);
-                }
-            });
+                            let _ = result_tx.send((issue_index, action));
+                        });
+                    }
+                    drop(result_tx);
+                    for (issue_index, action) in result_rx {
+                        issue_actions[issue_index] = Some(action);
+                    }
+                });
+            }
         }
 
         let issue_actions = issue_actions.into_iter().flatten().collect::<Vec<_>>();
         let act_artifact = ProcessIssuesWatchActArtifact {
+            dry_run: args.dry_run,
             fetched_at,
             repo: args.repo.clone(),
             label: args.label.clone(),
@@ -2160,6 +2242,11 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             "Acted issues: {} (skipped: {})",
             act_artifact.acted_count, act_artifact.skipped_count
         );
+        if args.dry_run {
+            println!(
+                "Dry run: no external mutations were performed (no codex subprocesses, git writes, or GitHub updates)."
+            );
+        }
         println!("Quick-fix attempted: {attempted_count}");
         println!("Quick-fix success: {success_count}");
         println!(
@@ -2685,6 +2772,45 @@ fn classify_issue_watch_triage(issue: &ProcessWatchIssueCandidate) -> IssueWatch
         return IssueWatchDecision::QuickFix;
     }
     IssueWatchDecision::NeedsManual
+}
+
+fn format_pr_comments_planned_action(decision: TriageDecision, dry_run: bool) -> String {
+    let prefix = if dry_run { "Would" } else { "Plan:" };
+    match decision {
+        TriageDecision::QuickFix => format!(
+            "{prefix} run targeted quick-fix automation (codex subprocess + branch/commit/push + follow-up PR/comment updates)."
+        ),
+        TriageDecision::NeedsIssue => {
+            format!("{prefix} create a follow-up GitHub issue linked to the source comment.")
+        }
+        TriageDecision::Question => {
+            format!("{prefix} leave for human reply; no automation mutation.")
+        }
+    }
+}
+
+fn format_issues_watch_planned_action(
+    decision: IssueWatchDecision,
+    skipped_reason: Option<IssueWatchSkippedReason>,
+    dry_run: bool,
+) -> String {
+    if let Some(reason) = skipped_reason {
+        return match reason {
+            IssueWatchSkippedReason::MaxActItemsCapReached => {
+                "Skipped: max act-items cap reached before this queued issue.".to_string()
+            }
+        };
+    }
+
+    let prefix = if dry_run { "Would" } else { "Plan:" };
+    match decision {
+        IssueWatchDecision::QuickFix => format!(
+            "{prefix} run targeted quick-fix automation (codex subprocess + branch/commit/push + follow-up PR + issue comment update)."
+        ),
+        IssueWatchDecision::NeedsManual => {
+            format!("{prefix} post a manual-follow-up guidance comment on the issue.")
+        }
+    }
 }
 
 fn run_issue_watch_quick_fix_subprocess(
@@ -4547,7 +4673,13 @@ mod tests {
         let Some(Subcommand::Process(ProcessCli { gh_retry, sub })) = cli.subcommand else {
             panic!("expected process subcommand");
         };
-        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr, act }) = sub else {
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs {
+            repo,
+            pr,
+            act,
+            dry_run,
+        }) = sub
+        else {
             panic!("expected process pr-comments");
         };
         assert_eq!(gh_retry.gh_max_attempts, 7);
@@ -4555,6 +4687,7 @@ mod tests {
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(pr, 1);
         assert!(!act);
+        assert!(!dry_run);
     }
 
     #[test]
@@ -4577,6 +4710,30 @@ mod tests {
             panic!("expected process pr-comments");
         };
         assert!(act);
+    }
+
+    #[test]
+    fn process_pr_comments_parses_dry_run_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+            "--act",
+            "--dry-run",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { act, dry_run, .. }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert!(act);
+        assert!(dry_run);
     }
 
     #[test]
@@ -4605,6 +4762,7 @@ mod tests {
             label,
             limit,
             act,
+            dry_run,
             max_concurrency,
             queue_delay_ms,
             max_act_items,
@@ -4613,6 +4771,7 @@ mod tests {
         assert_eq!(label, "process:auto-fix");
         assert_eq!(limit, 20);
         assert!(!act);
+        assert!(!dry_run);
         assert_eq!(max_concurrency, DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY);
         assert_eq!(queue_delay_ms, DEFAULT_ISSUES_WATCH_QUEUE_DELAY_MS);
         assert_eq!(max_act_items, None);
@@ -4642,6 +4801,34 @@ mod tests {
         };
         let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { act, .. }) = sub;
         assert!(act);
+    }
+
+    #[test]
+    fn process_issues_watch_parses_dry_run_mode() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--limit",
+            "20",
+            "--act",
+            "--dry-run",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { act, dry_run, .. }) = sub;
+        assert!(act);
+        assert!(dry_run);
     }
 
     #[test]
@@ -4937,6 +5124,28 @@ mod tests {
     }
 
     #[test]
+    fn format_pr_comments_planned_action_mentions_dry_run_intent() {
+        let planned = format_pr_comments_planned_action(TriageDecision::QuickFix, true);
+        assert_eq!(
+            planned,
+            "Would run targeted quick-fix automation (codex subprocess + branch/commit/push + follow-up PR/comment updates).".to_string()
+        );
+    }
+
+    #[test]
+    fn format_issues_watch_planned_action_mentions_skip_reason() {
+        let planned = format_issues_watch_planned_action(
+            IssueWatchDecision::QuickFix,
+            Some(IssueWatchSkippedReason::MaxActItemsCapReached),
+            true,
+        );
+        assert_eq!(
+            planned,
+            "Skipped: max act-items cap reached before this queued issue.".to_string()
+        );
+    }
+
+    #[test]
     fn format_follow_up_issue_body_renders_readable_markdown() {
         let body = format_follow_up_issue_body(
             "openai/codex",
@@ -5141,6 +5350,7 @@ mod tests {
                 comment_url: "https://github.com/openai/codex-process/pull/42#discussion_r1"
                     .to_string(),
                 decision: TriageDecision::QuickFix,
+                planned_action: "Plan: run targeted quick-fix automation (codex subprocess + branch/commit/push + follow-up PR/comment updates).".to_string(),
                 created_issue_url: None,
                 todo: None,
                 quick_fix_attempted: true,
