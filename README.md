@@ -59,6 +59,7 @@ codex process run --task "Implement X"
 codex process status --run-id <id>
 codex process pr-comments --repo owner/repo --pr 123
 codex process pr-comments --repo owner/repo --pr 123 --act
+codex process pr-comments --repo owner/repo --pr 123 --gh-max-attempts 7 --gh-base-backoff-ms 750
 codex process issues watch --repo owner/repo --label process:auto-fix --limit 20
 codex process issues watch --repo owner/repo --label process:auto-fix --limit 20 --act
 ```
@@ -71,6 +72,7 @@ When at least one quick fix succeeds, the command posts one concise PR update co
 For `needs_issue` items, follow-up issues are opened via `gh issue create` and linked in the artifact.
 The `issues watch` subcommand fetches matching open issues and writes `.process/runs/<run-id>/issues-watch.json` with `fetchedAt`, `repo`, `label`, `openIssues[]`, and `suggestedActions[]`.
 With `--act`, `issues watch` triages each issue (`quick_fix` or `needs_manual`) and isolates each quick-fix attempt so one issue failure does not abort the rest. Successful quick-fix attempts run targeted `codex exec` in an isolated worktree branch, commit/push changes, open a follow-up PR, and post a status comment back on the issue via `gh issue comment`. Non-successful attempts post a concise manual-follow-up comment with the failure reason. Action runs write `.process/runs/<run-id>/issues-watch-act.json` with `fetchedAt`, `repo`, `label`, and per-issue `issueActions[]` entries: `issueNumber`, `issueUrl`, `decision`, `attempted`, `success`, `branch`, `commitSha`, `commitUrl`, `prUrl`, `prNumber`, `updateCommentUrl`, and `error`.
+`gh` process-mode calls now retry transient API failures (including rate limiting/abuse/secondary-limit signals) with exponential backoff + jitter. Tune behavior with `--gh-max-attempts` (default `5`) and `--gh-base-backoff-ms` (default `500`).
 
 ## Docs
 
