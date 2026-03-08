@@ -43,6 +43,8 @@ EXAMPLE_CASES: list[tuple[str, str]] = [
     ("10_error_handling_and_retry", "async.py"),
     ("11_cli_mini_app", "sync.py"),
     ("11_cli_mini_app", "async.py"),
+    ("12_turn_params_kitchen_sink", "sync.py"),
+    ("12_turn_params_kitchen_sink", "async.py"),
 ]
 
 
@@ -153,3 +155,5 @@ def test_real_examples_run_and_assert(folder: str, script: str):
         assert "Text:" in out
     elif folder == "11_cli_mini_app":
         assert "Thread:" in out
+    elif folder == "12_turn_params_kitchen_sink":
+        assert "Status:" in out and "Usage:" in out

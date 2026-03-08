@@ -3,6 +3,26 @@ import asyncio
 from codex_app_server import AsyncCodex, TextInput
 
 
+def _status_value(status: object | None) -> str:
+    return str(getattr(status, "value", status))
+
+
+def _format_usage(usage: object | None) -> str:
+    if usage is None:
+        return "usage> (none)"
+
+    last = getattr(usage, "last", None)
+    total = getattr(usage, "total", None)
+    if last is None or total is None:
+        return f"usage> {usage}"
+
+    return (
+        "usage>\n"
+        f"  last: input={last.inputTokens} output={last.outputTokens} reasoning={last.reasoningOutputTokens} total={last.totalTokens} cached={last.cachedInputTokens}\n"
+        f"  total: input={total.inputTokens} output={total.outputTokens} reasoning={total.reasoningOutputTokens} total={total.totalTokens} cached={total.cachedInputTokens}"
+    )
+
+
 async def main() -> None:
     print("Codex async mini CLI. Type /exit to quit.")
 
@@ -22,13 +42,38 @@ async def main() -> None:
                 break
 
             turn = await thread.turn(TextInput(user_input))
-            result = await turn.run()
+            usage = None
+            status = None
+            error = None
+            printed_delta = False
 
-            if result.status == "failed":
-                print("assistant> [failed]", result.error)
-                continue
+            print("assistant> ", end="", flush=True)
+            async for event in turn.stream():
+                if event.method == "item/agentMessage/delta":
+                    delta = getattr(event.payload, "delta", "")
+                    if delta:
+                        print(delta, end="", flush=True)
+                        printed_delta = True
+                    continue
+                if event.method == "thread/token_usage_updated":
+                    usage = getattr(event.payload, "tokenUsage", None)
+                    continue
+                if event.method == "turn/completed":
+                    completed_turn = getattr(event.payload, "turn", None)
+                    status = getattr(completed_turn, "status", None)
+                    error = getattr(completed_turn, "error", None)
 
-            print("assistant>", result.text.strip())
+            if printed_delta:
+                print()
+            else:
+                print("[no text]")
+
+            status_text = _status_value(status)
+            print(f"assistant.status> {status_text}")
+            if status_text == "failed":
+                print("assistant.error>", error)
+
+            print(_format_usage(usage))
 
 
 if __name__ == "__main__":

@@ -47,3 +47,5 @@ python examples/01_quickstart_constructor/async.py
   - overload retry pattern + typed error handling structure
 - `11_cli_mini_app/`
   - interactive chat loop
+- `12_turn_params_kitchen_sink/`
+  - one turn using most optional `turn(...)` params (sync + async)
