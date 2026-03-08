@@ -578,7 +578,3 @@ class AppServerClient:
         if not isinstance(payload, dict):
             raise AppServerError(f"Expected JSON object message, got: {type(payload).__name__}")
         return payload
-
-
-def default_codex_home() -> Path:
-    return Path.home() / ".codex"

@@ -1,18 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 
 class AppServerError(Exception):
     """Base exception for SDK errors."""
-
-
-@dataclass(slots=True)
-class JsonRpcErrorPayload:
-    code: int
-    message: str
-    data: Any = None
 
 
 class JsonRpcError(AppServerError):
