@@ -319,6 +319,9 @@ impl WatchdogManager {
         let helper_prompt =
             watchdog_helper_prompt(&helper_config, snapshot.owner_thread_id, &snapshot.prompt)
                 .await;
+        // Watchdog check-ins must fork a distinct helper thread. If this path ever resumes
+        // the owner thread instead, the owner can self-wake and rapidly duplicate session
+        // state in memory.
         let spawn_result = control_for_spawn
             .fork_agent(
                 helper_config,

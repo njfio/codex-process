@@ -228,10 +228,9 @@ impl AgentControl {
                                 "parent thread rollout unavailable for fork: {parent_thread_id}"
                             ))
                         })?;
-                    let mut forked_rollout_items =
-                        RolloutRecorder::get_rollout_history(&rollout_path)
-                            .await?
-                            .get_rollout_items();
+                    let mut forked_rollout_items = RolloutRecorder::get_fork_history(&rollout_path)
+                        .await?
+                        .get_rollout_items();
                     let mut output = FunctionCallOutputPayload::from_text(
                         FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string(),
                     );
@@ -352,7 +351,9 @@ impl AgentControl {
                     "rollout history unavailable for thread {parent_thread_id}"
                 ))
             })?;
-        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        // Fork helpers must start as distinct child threads. Reusing the resume loader here
+        // preserves the parent conversation id and can cause the owner to resume itself.
+        let initial_history = RolloutRecorder::get_fork_history(&rollout_path).await?;
 
         let new_thread = state
             .fork_thread_with_source(
@@ -1072,6 +1073,7 @@ mod tests {
     use crate::config_loader::LoaderOverrides;
     use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
     use crate::features::Feature;
+    use crate::rollout::recorder::RolloutRecorder;
     use assert_matches::assert_matches;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::models::ContentItem;
@@ -1839,6 +1841,83 @@ mod tests {
         let injected_output_index = injected_output_index
             .expect("forked child should include synthetic output for the parent spawn_agent call");
         assert!(parent_call_index < injected_output_index);
+
+        let _ = harness
+            .control
+            .shutdown_agent(child_thread_id)
+            .await
+            .expect("child shutdown should submit");
+        let _ = parent_thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("parent shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn fork_agent_uses_distinct_thread_id_and_marks_parent() {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let turn_context = parent_thread.codex.session.new_default_turn().await;
+        parent_thread
+            .codex
+            .session
+            .record_conversation_items(
+                turn_context.as_ref(),
+                &[ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "parent seed context".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                }],
+            )
+            .await;
+        parent_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.codex.session.flush_rollout().await;
+
+        let child_thread_id = harness
+            .control
+            .fork_agent(
+                harness.config.clone(),
+                text_input("watchdog helper"),
+                parent_thread_id,
+                usize::MAX,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                }),
+            )
+            .await
+            .expect("fork_agent should spawn a distinct child thread");
+
+        assert_ne!(child_thread_id, parent_thread_id);
+
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        let history = child_thread.codex.session.clone_history().await;
+        assert!(history_contains_text(
+            history.raw_items(),
+            "parent seed context"
+        ));
+
+        let child_rollout_path = child_thread
+            .rollout_path()
+            .expect("forked child should have a rollout path");
+        let child_history = RolloutRecorder::get_rollout_history(&child_rollout_path)
+            .await
+            .expect("child rollout should load");
+        assert_eq!(child_history.forked_from_id(), Some(parent_thread_id));
 
         let _ = harness
             .control
