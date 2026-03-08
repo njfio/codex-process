@@ -70,7 +70,7 @@ const GUARDIAN_RECENT_ENTRY_LIMIT: usize = 40;
 const GUARDIAN_TRUNCATION_TAG: &str = "guardian_truncated";
 
 pub(crate) const GUARDIAN_REJECTION_MESSAGE: &str = concat!(
-    "Guardian rejected this action due to unacceptable risk. ",
+    "This action was rejected due to unacceptable risk. ",
     "The agent must not attempt to achieve the same outcome via workaround, ",
     "indirect execution, or policy circumvention. ",
     "Proceed only with a materially safer alternative, or stop and request user input.",
@@ -172,10 +172,7 @@ async fn run_guardian_review(
 ) -> ReviewDecision {
     let assessment_id = Uuid::new_v4().to_string();
     session
-        .notify_background_event(
-            turn.as_ref(),
-            "Guardian assessing approval request...".to_string(),
-        )
+        .notify_background_event(turn.as_ref(), "Reviewing approval request...".to_string())
         .await;
     session
         .send_event(
@@ -218,14 +215,15 @@ async fn run_guardian_review(
         Some(Err(err)) => GuardianAssessment {
             risk_level: GuardianRiskLevel::High,
             risk_score: 100,
-            rationale: format!("Guardian review failed: {err}"),
+            rationale: format!("Automatic approval review failed: {err}"),
             evidence: vec![],
         },
         None => GuardianAssessment {
             risk_level: GuardianRiskLevel::High,
             risk_score: 100,
-            rationale: "Guardian review timed out while evaluating the requested approval."
-                .to_string(),
+            rationale:
+                "Automatic approval review timed out while evaluating the requested approval."
+                    .to_string(),
             evidence: vec![],
         },
     };
@@ -235,8 +233,7 @@ async fn run_guardian_review(
     // Emit a concise warning so the parent turn has an auditable summary of the
     // guardian decision without needing the full subagent transcript.
     let warning = format!(
-        "Guardian {verdict} approval request ({}/100, {}): {}",
-        assessment.risk_score,
+        "Automatic approval review {verdict} (risk: {}): {}",
         guardian_risk_level_str(assessment.risk_level),
         assessment.rationale
     );
