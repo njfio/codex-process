@@ -144,6 +144,9 @@ enum Subcommand {
     #[clap(hide = true, name = "stdio-to-uds")]
     StdioToUds(StdioToUdsCommand),
 
+    /// [EXPERIMENTAL] Run process-mode orchestration commands.
+    Process(ProcessCli),
+
     /// Inspect feature flags.
     Features(FeaturesCli),
 }
@@ -539,6 +542,48 @@ struct FeatureSetArgs {
     feature: String,
 }
 
+#[derive(Debug, Parser)]
+struct ProcessCli {
+    #[command(subcommand)]
+    sub: ProcessSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ProcessSubcommand {
+    /// Start a process-mode run and scaffold required artifacts.
+    Run(ProcessRunArgs),
+    /// Inspect a process-mode run by id, or the latest run if omitted.
+    Status(ProcessStatusArgs),
+    /// Scaffold PR comment response planning artifacts.
+    #[clap(name = "pr-comments")]
+    PrComments(ProcessPrCommentsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProcessRunArgs {
+    /// Task description for this run.
+    #[arg(long)]
+    task: String,
+}
+
+#[derive(Debug, Args)]
+struct ProcessStatusArgs {
+    /// Run id to inspect (defaults to latest run in .process/runs).
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProcessPrCommentsArgs {
+    /// Repository in owner/name format.
+    #[arg(long)]
+    repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pr: u64,
+}
+
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
     use codex_core::features::Stage;
     match stage {
@@ -781,6 +826,17 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
         }
+        Some(Subcommand::Process(ProcessCli { sub })) => match sub {
+            ProcessSubcommand::Run(args) => {
+                run_process_mode(args)?;
+            }
+            ProcessSubcommand::Status(args) => {
+                process_mode_status(args)?;
+            }
+            ProcessSubcommand::PrComments(args) => {
+                process_mode_pr_comments(args)?;
+            }
+        },
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 // Respect root-level `-c` overrides plus top-level flags like `--profile`.
@@ -833,6 +889,128 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         },
     }
 
+    Ok(())
+}
+
+fn run_process_mode(args: ProcessRunArgs) -> anyhow::Result<()> {
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let contract = serde_json::json!({
+        "run_id": run_id,
+        "state": "CONTRACT",
+        "task": args.task,
+        "status": "pending"
+    });
+    std::fs::write(run_dir.join("contract.json"), serde_json::to_string_pretty(&contract)?)?;
+
+    let red_proof = serde_json::json!({
+        "state": "RED",
+        "status": "pending",
+        "required": "capture failing test proof"
+    });
+    std::fs::write(
+        run_dir.join("red-proof.json"),
+        serde_json::to_string_pretty(&red_proof)?,
+    )?;
+
+    let verify = serde_json::json!({
+        "state": "VERIFY",
+        "status": "pending",
+        "required": ["lint", "tests"]
+    });
+    std::fs::write(run_dir.join("verify.json"), serde_json::to_string_pretty(&verify)?)?;
+
+    let traceability = serde_json::json!({
+        "state": "EVIDENCE",
+        "status": "pending",
+        "ac_to_tests_to_files": []
+    });
+    std::fs::write(
+        run_dir.join("traceability.json"),
+        serde_json::to_string_pretty(&traceability)?,
+    )?;
+
+    let summary = format!(
+        "# Process Run {run_id}\n\n- task: {}\n- state: INTAKE\n- status: bootstrapped\n",
+        contract["task"].as_str().unwrap_or_default()
+    );
+    std::fs::write(run_dir.join("summary.md"), summary)?;
+
+    println!("Process run bootstrapped: {run_id}");
+    println!("Artifacts: {}", run_dir.display());
+    Ok(())
+}
+
+fn process_mode_status(args: ProcessStatusArgs) -> anyhow::Result<()> {
+    let runs_dir = std::path::PathBuf::from(".process/runs");
+    let run_id = if let Some(run_id) = args.run_id {
+        run_id
+    } else {
+        let mut run_ids = std::fs::read_dir(&runs_dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        run_ids.sort();
+        run_ids
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("No process runs found in {}", runs_dir.display()))?
+    };
+
+    let run_dir = runs_dir.join(&run_id);
+    if !run_dir.exists() {
+        return Err(anyhow::anyhow!("Run not found: {}", run_dir.display()));
+    }
+
+    println!("Run: {run_id}");
+    println!("Directory: {}", run_dir.display());
+    for name in [
+        "contract.json",
+        "red-proof.json",
+        "verify.json",
+        "traceability.json",
+        "summary.md",
+    ] {
+        let path = run_dir.join(name);
+        let status = if path.exists() { "present" } else { "missing" };
+        println!("- {name}: {status}");
+    }
+    Ok(())
+}
+
+fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "mode": "pr-comments",
+        "repo": args.repo,
+        "pr": args.pr,
+        "status": "scaffolded",
+        "next": [
+            "fetch unresolved comments",
+            "classify by severity and type",
+            "prepare patch and evidence-backed responses"
+        ]
+    });
+    std::fs::write(
+        run_dir.join("pr-comments.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
+
+    println!("PR comment response run scaffolded: {run_id}");
+    println!("Target: {}#{}", payload["repo"].as_str().unwrap_or_default(), args.pr);
+    println!("Artifact: {}", run_dir.join("pr-comments.json").display());
     Ok(())
 }
 
@@ -1498,6 +1676,47 @@ mod tests {
             panic!("expected features disable");
         };
         assert_eq!(feature, "shell_tool");
+    }
+
+    #[test]
+    fn process_run_parses_task() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "run",
+            "--task",
+            "Implement process mode",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Run(ProcessRunArgs { task }) = sub else {
+            panic!("expected process run");
+        };
+        assert_eq!(task, "Implement process mode");
+    }
+
+    #[test]
+    fn process_pr_comments_parses_target() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "pr-comments",
+            "--repo",
+            "njfio/codex-process",
+            "--pr",
+            "1",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::PrComments(ProcessPrCommentsArgs { repo, pr }) = sub else {
+            panic!("expected process pr-comments");
+        };
+        assert_eq!(repo, "njfio/codex-process");
+        assert_eq!(pr, 1);
     }
 
     #[test]

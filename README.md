@@ -50,6 +50,18 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+## Process Mode (fork-specific, experimental)
+
+This fork adds an experimental `process` command group to bootstrap process-native runs:
+
+```shell
+codex process run --task "Implement X"
+codex process status --run-id <id>
+codex process pr-comments --repo owner/repo --pr 123
+```
+
+The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
