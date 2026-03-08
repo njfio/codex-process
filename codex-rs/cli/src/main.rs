@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
+use anyhow::Context;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
@@ -30,6 +31,7 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
@@ -554,7 +556,7 @@ enum ProcessSubcommand {
     Run(ProcessRunArgs),
     /// Inspect a process-mode run by id, or the latest run if omitted.
     Status(ProcessStatusArgs),
-    /// Scaffold PR comment response planning artifacts.
+    /// Ingest open PR comments from GitHub and scaffold response planning artifacts.
     #[clap(name = "pr-comments")]
     PrComments(ProcessPrCommentsArgs),
 }
@@ -984,6 +986,7 @@ fn process_mode_status(args: ProcessStatusArgs) -> anyhow::Result<()> {
 }
 
 fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
+    let (owner, name) = parse_repo_owner_and_name(&args.repo)?;
     let run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
@@ -991,27 +994,375 @@ fn process_mode_pr_comments(args: ProcessPrCommentsArgs) -> anyhow::Result<()> {
     let run_dir = std::path::PathBuf::from(".process/runs").join(&run_id);
     std::fs::create_dir_all(&run_dir)?;
 
-    let payload = serde_json::json!({
-        "run_id": run_id,
-        "mode": "pr-comments",
-        "repo": args.repo,
-        "pr": args.pr,
-        "status": "scaffolded",
-        "next": [
-            "fetch unresolved comments",
-            "classify by severity and type",
-            "prepare patch and evidence-backed responses"
-        ]
-    });
+    let unresolved_review_comments = fetch_unresolved_review_comments(&owner, &name, args.pr)
+        .with_context(|| format!("Failed to fetch unresolved review comments for {}#{}", args.repo, args.pr))?;
+    let open_issue_comments = fetch_issue_comments(&args.repo, args.pr)
+        .with_context(|| format!("Failed to fetch issue comments for {}#{}", args.repo, args.pr))?;
+    let grouped_by_type = GroupedByType {
+        unresolved_review_comments: unresolved_review_comments.len(),
+        open_issue_comments: open_issue_comments.len(),
+        total: unresolved_review_comments.len() + open_issue_comments.len(),
+    };
+    let payload = ProcessPrCommentsArtifact {
+        repo: args.repo.clone(),
+        pr: args.pr,
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        unresolved_review_comments,
+        open_issue_comments,
+        grouped_by_type,
+        suggested_next_actions: suggested_next_actions(&grouped_by_type),
+    };
     std::fs::write(
         run_dir.join("pr-comments.json"),
         serde_json::to_string_pretty(&payload)?,
     )?;
 
-    println!("PR comment response run scaffolded: {run_id}");
-    println!("Target: {}#{}", payload["repo"].as_str().unwrap_or_default(), args.pr);
+    println!("PR comment response run created: {run_id}");
+    println!("Target: {}#{}", args.repo, args.pr);
     println!("Artifact: {}", run_dir.join("pr-comments.json").display());
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProcessPrCommentsArtifact {
+    repo: String,
+    pr: u64,
+    fetched_at: u64,
+    unresolved_review_comments: Vec<UnresolvedReviewComment>,
+    open_issue_comments: Vec<OpenIssueComment>,
+    grouped_by_type: GroupedByType,
+    suggested_next_actions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+struct UnresolvedReviewComment {
+    id: String,
+    author: String,
+    path: String,
+    line: Option<u64>,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+struct OpenIssueComment {
+    id: String,
+    author: String,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GroupedByType {
+    unresolved_review_comments: usize,
+    open_issue_comments: usize,
+    total: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlResponse {
+    data: Option<GhGraphQlData>,
+    errors: Option<Vec<GhGraphQlError>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlError {
+    message: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhGraphQlData {
+    repository: Option<GhRepository>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GhPullRequest>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    review_threads: GhReviewThreadConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThreadConnection {
+    nodes: Vec<GhReviewThreadNode>,
+    page_info: GhPageInfo,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThreadNode {
+    is_resolved: bool,
+    comments: GhReviewCommentConnection,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhReviewCommentConnection {
+    nodes: Vec<GhReviewCommentNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewCommentNode {
+    id: String,
+    author: Option<GhActor>,
+    path: String,
+    line: Option<u64>,
+    body: String,
+    url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhActor {
+    login: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum GhIssueCommentsResponse {
+    Paged(Vec<Vec<GhIssueCommentNode>>),
+    Flat(Vec<GhIssueCommentNode>),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhIssueCommentNode {
+    id: u64,
+    body: String,
+    html_url: String,
+    user: GhIssueCommentUser,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhIssueCommentUser {
+    login: String,
+}
+
+fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
+    };
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        anyhow::bail!("Invalid --repo value `{repo}`. Expected `owner/name`.");
+    }
+    Ok((owner.to_string(), name.to_string()))
+}
+
+fn fetch_unresolved_review_comments(
+    owner: &str,
+    name: &str,
+    pr: u64,
+) -> anyhow::Result<Vec<UnresolvedReviewComment>> {
+    const GRAPHQL_QUERY: &str = r#"query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        nodes {
+          isResolved
+          comments(first: 100) {
+            nodes {
+              id
+              author { login }
+              path
+              line
+              body
+              url
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}"#;
+
+    let mut unresolved_comments = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={GRAPHQL_QUERY}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("pr={pr}"),
+        ];
+        if let Some(cursor_value) = cursor.as_ref() {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor_value}"));
+        }
+
+        let page_json = run_gh_json_command(&args)?;
+        let parsed_page = parse_unresolved_review_comment_page(page_json)?;
+        unresolved_comments.extend(parsed_page.comments);
+
+        if !parsed_page.has_next_page {
+            break;
+        }
+        let Some(next_cursor) = parsed_page.end_cursor else {
+            anyhow::bail!("GitHub API returned pagination without a cursor for unresolved review comments.");
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(unresolved_comments)
+}
+
+fn fetch_issue_comments(repo: &str, pr: u64) -> anyhow::Result<Vec<OpenIssueComment>> {
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/issues/{pr}/comments"),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+    ];
+    let issue_json = run_gh_json_command(&args)?;
+    parse_issue_comments(issue_json)
+}
+
+fn run_gh_json_command(args: &[String]) -> anyhow::Result<serde_json::Value> {
+    let output = std::process::Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "GitHub CLI (`gh`) is not available in PATH. Install from https://cli.github.com/ and run `gh auth login`."
+                )
+            } else {
+                anyhow::anyhow!("Failed to start `gh`: {err}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "no output captured".to_string()
+        };
+        anyhow::bail!(
+            "`gh {}` failed with status {}: {}\nCheck `gh auth status` and verify repo/PR access.",
+            args.join(" "),
+            output.status,
+            details
+        );
+    }
+
+    serde_json::from_slice(&output.stdout).context("`gh` returned invalid JSON output")
+}
+
+struct UnresolvedReviewCommentPage {
+    comments: Vec<UnresolvedReviewComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn parse_unresolved_review_comment_page(
+    page_json: serde_json::Value,
+) -> anyhow::Result<UnresolvedReviewCommentPage> {
+    let response: GhGraphQlResponse =
+        serde_json::from_value(page_json).context("Failed to parse GitHub GraphQL response")?;
+
+    if let Some(errors) = response.errors
+        && !errors.is_empty()
+    {
+        let messages = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("GitHub GraphQL returned errors: {messages}");
+    }
+
+    let review_threads = response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repo| repo.pull_request)
+        .map(|pr| pr.review_threads)
+        .ok_or_else(|| anyhow::anyhow!("GitHub GraphQL response did not include pull request review threads."))?;
+
+    let comments = review_threads
+        .nodes
+        .into_iter()
+        .filter(|thread| !thread.is_resolved)
+        .flat_map(|thread| thread.comments.nodes)
+        .map(|comment| UnresolvedReviewComment {
+            id: comment.id,
+            author: comment.author.map_or_else(|| "unknown".to_string(), |author| author.login),
+            path: comment.path,
+            line: comment.line,
+            body: comment.body,
+            url: comment.url,
+        })
+        .collect();
+
+    Ok(UnresolvedReviewCommentPage {
+        comments,
+        has_next_page: review_threads.page_info.has_next_page,
+        end_cursor: review_threads.page_info.end_cursor,
+    })
+}
+
+fn parse_issue_comments(issue_json: serde_json::Value) -> anyhow::Result<Vec<OpenIssueComment>> {
+    let response: GhIssueCommentsResponse =
+        serde_json::from_value(issue_json).context("Failed to parse GitHub issue comments response")?;
+
+    let comments = match response {
+        GhIssueCommentsResponse::Paged(pages) => pages.into_iter().flatten().collect(),
+        GhIssueCommentsResponse::Flat(items) => items,
+    };
+
+    Ok(comments
+        .into_iter()
+        .map(|comment| OpenIssueComment {
+            id: comment.id.to_string(),
+            author: comment.user.login,
+            body: comment.body,
+            url: comment.html_url,
+        })
+        .collect())
+}
+
+fn suggested_next_actions(grouped_by_type: &GroupedByType) -> Vec<String> {
+    let mut actions = Vec::new();
+    if grouped_by_type.unresolved_review_comments > 0 {
+        actions.push("Address unresolved review comments first.".to_string());
+    }
+    if grouped_by_type.open_issue_comments > 0 {
+        actions.push("Reply to open issue comments on the PR conversation.".to_string());
+    }
+    if grouped_by_type.total == 0 {
+        actions.push("No open comments found; proceed with final verification and merge checks.".to_string());
+    } else {
+        actions.push("After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string());
+    }
+    actions
 }
 
 async fn enable_feature_in_config(interactive: &TuiCli, feature: &str) -> anyhow::Result<()> {
@@ -1717,6 +2068,154 @@ mod tests {
         };
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(pr, 1);
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_accepts_valid_repo() {
+        let parsed = parse_repo_owner_and_name("openai/codex").expect("repo parses");
+        assert_eq!(parsed, ("openai".to_string(), "codex".to_string()));
+    }
+
+    #[test]
+    fn parse_repo_owner_and_name_rejects_invalid_repo() {
+        let err = parse_repo_owner_and_name("openai").expect_err("repo should fail");
+        assert_eq!(
+            err.to_string(),
+            "Invalid --repo value `openai`. Expected `owner/name`."
+        );
+    }
+
+    #[test]
+    fn parse_unresolved_review_comment_page_filters_out_resolved_threads() {
+        let input = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "PRRC_1",
+                                                "author": { "login": "alice" },
+                                                "path": "src/lib.rs",
+                                                "line": 42,
+                                                "body": "Please simplify this branch.",
+                                                "url": "https://github.com/openai/codex/pull/1#discussion_r1"
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "isResolved": true,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "PRRC_2",
+                                                "author": { "login": "bob" },
+                                                "path": "src/main.rs",
+                                                "line": 7,
+                                                "body": "Already fixed.",
+                                                "url": "https://github.com/openai/codex/pull/1#discussion_r2"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "endCursor": null
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_unresolved_review_comment_page(input).expect("parses");
+        assert_eq!(
+            parsed.comments,
+            vec![UnresolvedReviewComment {
+                id: "PRRC_1".to_string(),
+                author: "alice".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: Some(42),
+                body: "Please simplify this branch.".to_string(),
+                url: "https://github.com/openai/codex/pull/1#discussion_r1".to_string(),
+            }]
+        );
+        assert!(!parsed.has_next_page);
+        assert_eq!(parsed.end_cursor, None);
+    }
+
+    #[test]
+    fn parse_issue_comments_supports_paginated_response() {
+        let input = serde_json::json!([
+            [
+                {
+                    "id": 101,
+                    "body": "Can you add a test?",
+                    "html_url": "https://github.com/openai/codex/issues/1#issuecomment-101",
+                    "user": { "login": "carol" }
+                }
+            ],
+            [
+                {
+                    "id": 202,
+                    "body": "Looks good after updates.",
+                    "html_url": "https://github.com/openai/codex/issues/1#issuecomment-202",
+                    "user": { "login": "dave" }
+                }
+            ]
+        ]);
+
+        let parsed = parse_issue_comments(input).expect("parses");
+        assert_eq!(
+            parsed,
+            vec![
+                OpenIssueComment {
+                    id: "101".to_string(),
+                    author: "carol".to_string(),
+                    body: "Can you add a test?".to_string(),
+                    url: "https://github.com/openai/codex/issues/1#issuecomment-101".to_string(),
+                },
+                OpenIssueComment {
+                    id: "202".to_string(),
+                    author: "dave".to_string(),
+                    body: "Looks good after updates.".to_string(),
+                    url: "https://github.com/openai/codex/issues/1#issuecomment-202".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn suggested_next_actions_handles_empty_and_non_empty_states() {
+        let empty = GroupedByType {
+            unresolved_review_comments: 0,
+            open_issue_comments: 0,
+            total: 0,
+        };
+        assert_eq!(
+            suggested_next_actions(&empty),
+            vec!["No open comments found; proceed with final verification and merge checks.".to_string()]
+        );
+
+        let non_empty = GroupedByType {
+            unresolved_review_comments: 1,
+            open_issue_comments: 2,
+            total: 3,
+        };
+        assert_eq!(
+            suggested_next_actions(&non_empty),
+            vec![
+                "Address unresolved review comments first.".to_string(),
+                "Reply to open issue comments on the PR conversation.".to_string(),
+                "After fixes, rerun `codex process pr-comments --repo <owner/name> --pr <number>` to confirm all comments are addressed.".to_string(),
+            ]
+        );
     }
 
     #[test]

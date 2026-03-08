@@ -61,6 +61,7 @@ codex process pr-comments --repo owner/repo --pr 123
 ```
 
 The command currently scaffolds machine-readable artifacts under `.process/runs/<run-id>/` for contract/red/verify/evidence stages.
+The `pr-comments` subcommand now performs live GitHub comment ingestion via `gh`, capturing unresolved PR review comments and issue comments into a structured `.process/runs/<run-id>/pr-comments.json` artifact.
 
 ## Docs
 
