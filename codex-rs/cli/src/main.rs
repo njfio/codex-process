@@ -557,6 +557,8 @@ struct ProcessCli {
 const DEFAULT_PROCESS_GH_MAX_ATTEMPTS: u32 = 5;
 const DEFAULT_PROCESS_GH_BASE_BACKOFF_MS: u64 = 500;
 const MAX_PROCESS_GH_BACKOFF_MS: u64 = 10_000;
+const DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY: usize = 1;
+const DEFAULT_ISSUES_WATCH_QUEUE_DELAY_MS: u64 = 250;
 
 #[derive(Debug, Args, Clone, Copy)]
 struct ProcessGhRetryArgs {
@@ -657,6 +659,18 @@ struct ProcessIssuesWatchArgs {
     /// Triage matching issues and attempt targeted quick-fix automation.
     #[arg(long, default_value_t = false)]
     act: bool,
+
+    /// Maximum number of issues to process concurrently in `--act` mode.
+    #[arg(long, default_value_t = DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY)]
+    max_concurrency: usize,
+
+    /// Delay between issue starts in `--act` mode (milliseconds).
+    #[arg(long, default_value_t = DEFAULT_ISSUES_WATCH_QUEUE_DELAY_MS, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    queue_delay_ms: u64,
+
+    /// Optional cap on number of issues acted on in one `--act` run.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    max_act_items: Option<u32>,
 }
 
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
@@ -1561,12 +1575,19 @@ enum IssueWatchDecision {
     NeedsManual,
 }
 
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IssueWatchSkippedReason {
+    MaxActItemsCapReached,
+}
+
 #[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ProcessIssuesWatchActIssueAction {
     issue_number: u64,
     issue_url: String,
     decision: IssueWatchDecision,
+    skipped_reason: Option<IssueWatchSkippedReason>,
     attempted: bool,
     success: bool,
     branch: Option<String>,
@@ -1584,7 +1605,24 @@ struct ProcessIssuesWatchActArtifact {
     fetched_at: u64,
     repo: String,
     label: String,
+    max_concurrency: usize,
+    queue_delay_ms: u64,
+    max_act_items: Option<usize>,
+    acted_count: usize,
+    skipped_count: usize,
     issue_actions: Vec<ProcessIssuesWatchActIssueAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessIssuesWatchActQueuePlan {
+    acted_indices: Vec<usize>,
+    skipped: Vec<ProcessIssuesWatchActQueueSkippedIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessIssuesWatchActQueueSkippedIssue {
+    issue_index: usize,
+    reason: IssueWatchSkippedReason,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
@@ -1754,6 +1792,24 @@ fn parse_repo_owner_and_name(repo: &str) -> anyhow::Result<(String, String)> {
     Ok((owner.to_string(), name.to_string()))
 }
 
+fn build_process_issues_watch_act_queue_plan(
+    total_issues: usize,
+    max_act_items: Option<usize>,
+) -> ProcessIssuesWatchActQueuePlan {
+    let allowed = max_act_items.unwrap_or(total_issues).min(total_issues);
+    let acted_indices = (0..allowed).collect::<Vec<_>>();
+    let skipped = (allowed..total_issues)
+        .map(|issue_index| ProcessIssuesWatchActQueueSkippedIssue {
+            issue_index,
+            reason: IssueWatchSkippedReason::MaxActItemsCapReached,
+        })
+        .collect();
+    ProcessIssuesWatchActQueuePlan {
+        acted_indices,
+        skipped,
+    }
+}
+
 fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()> {
     parse_repo_owner_and_name(&args.repo)?;
     let run_id = std::time::SystemTime::now()
@@ -1794,6 +1850,8 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
     )?;
 
     if args.act {
+        let max_act_items = args.max_act_items.map(|value| value as usize);
+        let queue_plan = build_process_issues_watch_act_queue_plan(issues.len(), max_act_items);
         let quick_fix_worktree_root = run_dir.join("quick-fix-worktrees");
         let quick_fix_root_error =
             std::fs::create_dir_all(&quick_fix_worktree_root)
@@ -1804,7 +1862,10 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
                         quick_fix_worktree_root.display()
                     )
                 });
-        let quick_fix_base_sha = current_git_head_sha();
+        let (quick_fix_base_sha, quick_fix_base_sha_error) = match current_git_head_sha() {
+            Ok(value) => (Some(value), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
         let quick_fix_pr_base_branch = match fetch_repo_default_branch_name(&args.repo) {
             Ok(Some(branch)) => branch,
             Ok(None) => "main".to_string(),
@@ -1817,13 +1878,14 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
             }
         };
 
-        let mut issue_actions = Vec::new();
-        for issue in &issues {
-            let decision = classify_issue_watch_triage(issue);
-            let mut action = ProcessIssuesWatchActIssueAction {
+        let mut issue_actions = vec![None; issues.len()];
+        for skipped in &queue_plan.skipped {
+            let issue = &issues[skipped.issue_index];
+            issue_actions[skipped.issue_index] = Some(ProcessIssuesWatchActIssueAction {
                 issue_number: issue.number,
                 issue_url: issue.url.clone(),
-                decision,
+                decision: classify_issue_watch_triage(issue),
+                skipped_reason: Some(skipped.reason),
                 attempted: false,
                 success: false,
                 branch: None,
@@ -1833,130 +1895,247 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
                 pr_number: None,
                 update_comment_url: None,
                 error: None,
-            };
-
-            match decision {
-                IssueWatchDecision::NeedsManual => {
-                    let reason = "Triaged as needs_manual for human follow-up (scope or risk is non-trivial).";
-                    let body = format_issue_watch_manual_follow_up_comment(reason);
-                    match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
-                        Ok(comment_url) => {
-                            action.update_comment_url = comment_url;
-                            action.error = Some(reason.to_string());
-                        }
-                        Err(err) => {
-                            action.error = Some(format!(
-                                "{reason} Failed to post issue update comment: {err}"
-                            ));
-                        }
-                    }
-                }
-                IssueWatchDecision::QuickFix => {
-                    let execution = if let Some(err) = &quick_fix_root_error {
-                        QuickFixExecutionResult {
-                            attempted: false,
-                            success: false,
-                            summary: None,
-                            error: Some(err.clone()),
-                            files: Vec::new(),
-                            verification: None,
-                            branch_name: None,
-                            commit_sha: None,
-                            commit_url: None,
-                            pushed: None,
-                            remote_branch: None,
-                            follow_up_pr_url: None,
-                            follow_up_pr_number: None,
-                            push_error: None,
-                            pr_error: None,
-                        }
-                    } else if let Ok(base_sha) = &quick_fix_base_sha {
-                        run_issue_watch_quick_fix_in_isolated_branch(
-                            &args.repo,
-                            issue,
-                            base_sha,
-                            &quick_fix_worktree_root,
-                            &run_id,
-                            &quick_fix_pr_base_branch,
-                        )
-                    } else {
-                        QuickFixExecutionResult {
-                            attempted: false,
-                            success: false,
-                            summary: None,
-                            error: Some(format!(
-                                "Unable to read current git HEAD for quick-fix branching: {}",
-                                quick_fix_base_sha.as_ref().err().map_or_else(
-                                    || "unknown error".to_string(),
-                                    ToString::to_string
-                                )
-                            )),
-                            files: Vec::new(),
-                            verification: None,
-                            branch_name: None,
-                            commit_sha: None,
-                            commit_url: None,
-                            pushed: None,
-                            remote_branch: None,
-                            follow_up_pr_url: None,
-                            follow_up_pr_number: None,
-                            push_error: None,
-                            pr_error: None,
-                        }
-                    };
-
-                    action.attempted = execution.attempted;
-                    action.success = execution.success;
-                    action.branch = execution.branch_name.clone();
-                    action.commit_sha = execution.commit_sha.clone();
-                    action.commit_url = execution.commit_url.clone();
-                    action.pr_url = execution.follow_up_pr_url.clone();
-                    action.pr_number = execution.follow_up_pr_number;
-                    action.error = execution.error.clone();
-
-                    if execution.success {
-                        let body = format_issue_watch_success_comment(
-                            execution.summary.as_deref(),
-                            execution.follow_up_pr_url.as_deref(),
-                            execution.follow_up_pr_number,
-                            execution.commit_url.as_deref(),
-                        );
-                        match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
-                            Ok(comment_url) => {
-                                action.update_comment_url = comment_url;
-                            }
-                            Err(err) => {
-                                action.error = Some(format!(
-                                    "Quick fix completed, but failed to post issue update comment: {err}"
-                                ));
-                            }
-                        }
-                    } else {
-                        let reason = action
-                            .error
-                            .as_deref()
-                            .unwrap_or("Quick-fix attempt failed for an unknown reason.");
-                        let body = format_issue_watch_manual_follow_up_comment(reason);
-                        match post_issue_watch_update_comment(&args.repo, issue.number, &body) {
-                            Ok(comment_url) => {
-                                action.update_comment_url = comment_url;
-                            }
-                            Err(err) => {
-                                action.error = Some(format!(
-                                    "{reason} Failed to post issue update comment: {err}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            issue_actions.push(action);
+            });
         }
 
+        let act_queue = queue_plan
+            .acted_indices
+            .iter()
+            .map(|&index| (index, issues[index].clone()))
+            .collect::<std::collections::VecDeque<_>>();
+        let total_to_act = act_queue.len();
+        if !act_queue.is_empty() {
+            let worker_count = args.max_concurrency.min(16).min(total_to_act).max(1);
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(act_queue));
+            let queue_remaining =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total_to_act));
+            let active_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let next_start_at =
+                std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+            let queue_delay = std::time::Duration::from_millis(args.queue_delay_ms);
+            let (result_tx, result_rx) =
+                std::sync::mpsc::channel::<(usize, ProcessIssuesWatchActIssueAction)>();
+
+            std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let queue = std::sync::Arc::clone(&queue);
+                    let queue_remaining = std::sync::Arc::clone(&queue_remaining);
+                    let active_count = std::sync::Arc::clone(&active_count);
+                    let next_start_at = std::sync::Arc::clone(&next_start_at);
+                    let result_tx = result_tx.clone();
+                    let repo = args.repo.clone();
+                    let run_id = run_id.clone();
+                    let quick_fix_worktree_root = quick_fix_worktree_root.clone();
+                    let quick_fix_root_error = quick_fix_root_error.clone();
+                    let quick_fix_base_sha = quick_fix_base_sha.clone();
+                    let quick_fix_base_sha_error = quick_fix_base_sha_error.clone();
+                    let quick_fix_pr_base_branch = quick_fix_pr_base_branch.clone();
+
+                    scope.spawn(move || loop {
+                        let maybe_work = {
+                            let mut queue_guard = match queue.lock() {
+                                Ok(guard) => guard,
+                                Err(poison) => poison.into_inner(),
+                            };
+                            queue_guard.pop_front()
+                        };
+                        let Some((issue_index, issue)) = maybe_work else {
+                            break;
+                        };
+
+                        let sleep_for = {
+                            let mut gate = match next_start_at.lock() {
+                                Ok(guard) => guard,
+                                Err(poison) => poison.into_inner(),
+                            };
+                            let now = std::time::Instant::now();
+                            let wait = gate.saturating_duration_since(now);
+                            let start_at = now + wait;
+                            *gate = start_at + queue_delay;
+                            wait
+                        };
+                        if !sleep_for.is_zero() {
+                            std::thread::sleep(sleep_for);
+                        }
+
+                        let queue_remaining_after_start = queue_remaining
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_sub(1);
+                        let active_after_start =
+                            active_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        eprintln!(
+                            "[issues-watch --act] start issue #{} (active={}, queue_remaining={})",
+                            issue.number, active_after_start, queue_remaining_after_start
+                        );
+
+                        let decision = classify_issue_watch_triage(&issue);
+                        let mut action = ProcessIssuesWatchActIssueAction {
+                            issue_number: issue.number,
+                            issue_url: issue.url.clone(),
+                            decision,
+                            skipped_reason: None,
+                            attempted: false,
+                            success: false,
+                            branch: None,
+                            commit_sha: None,
+                            commit_url: None,
+                            pr_url: None,
+                            pr_number: None,
+                            update_comment_url: None,
+                            error: None,
+                        };
+
+                        match decision {
+                            IssueWatchDecision::NeedsManual => {
+                                let reason = "Triaged as needs_manual for human follow-up (scope or risk is non-trivial).";
+                                let body = format_issue_watch_manual_follow_up_comment(reason);
+                                match post_issue_watch_update_comment(&repo, issue.number, &body) {
+                                    Ok(comment_url) => {
+                                        action.update_comment_url = comment_url;
+                                        action.error = Some(reason.to_string());
+                                    }
+                                    Err(err) => {
+                                        action.error = Some(format!(
+                                            "{reason} Failed to post issue update comment: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            IssueWatchDecision::QuickFix => {
+                                let execution = if let Some(err) = &quick_fix_root_error {
+                                    QuickFixExecutionResult {
+                                        attempted: false,
+                                        success: false,
+                                        summary: None,
+                                        error: Some(err.clone()),
+                                        files: Vec::new(),
+                                        verification: None,
+                                        branch_name: None,
+                                        commit_sha: None,
+                                        commit_url: None,
+                                        pushed: None,
+                                        remote_branch: None,
+                                        follow_up_pr_url: None,
+                                        follow_up_pr_number: None,
+                                        push_error: None,
+                                        pr_error: None,
+                                    }
+                                } else if let Some(base_sha) = &quick_fix_base_sha {
+                                    run_issue_watch_quick_fix_in_isolated_branch(
+                                        &repo,
+                                        &issue,
+                                        base_sha,
+                                        &quick_fix_worktree_root,
+                                        &run_id,
+                                        &quick_fix_pr_base_branch,
+                                    )
+                                } else {
+                                    QuickFixExecutionResult {
+                                        attempted: false,
+                                        success: false,
+                                        summary: None,
+                                        error: Some(format!(
+                                            "Unable to read current git HEAD for quick-fix branching: {}",
+                                            quick_fix_base_sha_error
+                                                .clone()
+                                                .unwrap_or_else(|| "unknown error".to_string())
+                                        )),
+                                        files: Vec::new(),
+                                        verification: None,
+                                        branch_name: None,
+                                        commit_sha: None,
+                                        commit_url: None,
+                                        pushed: None,
+                                        remote_branch: None,
+                                        follow_up_pr_url: None,
+                                        follow_up_pr_number: None,
+                                        push_error: None,
+                                        pr_error: None,
+                                    }
+                                };
+
+                                action.attempted = execution.attempted;
+                                action.success = execution.success;
+                                action.branch = execution.branch_name.clone();
+                                action.commit_sha = execution.commit_sha.clone();
+                                action.commit_url = execution.commit_url.clone();
+                                action.pr_url = execution.follow_up_pr_url.clone();
+                                action.pr_number = execution.follow_up_pr_number;
+                                action.error = execution.error.clone();
+
+                                if execution.success {
+                                    let body = format_issue_watch_success_comment(
+                                        execution.summary.as_deref(),
+                                        execution.follow_up_pr_url.as_deref(),
+                                        execution.follow_up_pr_number,
+                                        execution.commit_url.as_deref(),
+                                    );
+                                    match post_issue_watch_update_comment(&repo, issue.number, &body)
+                                    {
+                                        Ok(comment_url) => {
+                                            action.update_comment_url = comment_url;
+                                        }
+                                        Err(err) => {
+                                            action.error = Some(format!(
+                                                "Quick fix completed, but failed to post issue update comment: {err}"
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    let reason = action
+                                        .error
+                                        .as_deref()
+                                        .unwrap_or("Quick-fix attempt failed for an unknown reason.");
+                                    let body = format_issue_watch_manual_follow_up_comment(reason);
+                                    match post_issue_watch_update_comment(&repo, issue.number, &body)
+                                    {
+                                        Ok(comment_url) => {
+                                            action.update_comment_url = comment_url;
+                                        }
+                                        Err(err) => {
+                                            action.error = Some(format!(
+                                                "{reason} Failed to post issue update comment: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let active_after_finish = active_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_sub(1);
+                        let queue_remaining_now =
+                            queue_remaining.load(std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "[issues-watch --act] done issue #{} success={} attempted={} (active={}, queue_remaining={})",
+                            issue.number,
+                            action.success,
+                            action.attempted,
+                            active_after_finish,
+                            queue_remaining_now
+                        );
+
+                        let _ = result_tx.send((issue_index, action));
+                    });
+                }
+                drop(result_tx);
+                for (issue_index, action) in result_rx {
+                    issue_actions[issue_index] = Some(action);
+                }
+            });
+        }
+
+        let issue_actions = issue_actions.into_iter().flatten().collect::<Vec<_>>();
         let act_artifact = ProcessIssuesWatchActArtifact {
             fetched_at,
             repo: args.repo.clone(),
             label: args.label.clone(),
+            max_concurrency: args.max_concurrency,
+            queue_delay_ms: args.queue_delay_ms,
+            max_act_items,
+            acted_count: queue_plan.acted_indices.len(),
+            skipped_count: queue_plan.skipped.len(),
             issue_actions,
         };
         std::fs::write(
@@ -1977,6 +2156,10 @@ fn process_mode_issues_watch(args: ProcessIssuesWatchArgs) -> anyhow::Result<()>
         println!("Issues watch action run created: {run_id}");
         println!("Target: {} [{}]", args.repo, args.label);
         println!("Open issues fetched: {}", artifact.open_issues.len());
+        println!(
+            "Acted issues: {} (skipped: {})",
+            act_artifact.acted_count, act_artifact.skipped_count
+        );
         println!("Quick-fix attempted: {attempted_count}");
         println!("Quick-fix success: {success_count}");
         println!(
@@ -4422,11 +4605,17 @@ mod tests {
             label,
             limit,
             act,
+            max_concurrency,
+            queue_delay_ms,
+            max_act_items,
         }) = sub;
         assert_eq!(repo, "njfio/codex-process");
         assert_eq!(label, "process:auto-fix");
         assert_eq!(limit, 20);
         assert!(!act);
+        assert_eq!(max_concurrency, DEFAULT_ISSUES_WATCH_MAX_CONCURRENCY);
+        assert_eq!(queue_delay_ms, DEFAULT_ISSUES_WATCH_QUEUE_DELAY_MS);
+        assert_eq!(max_act_items, None);
     }
 
     #[test]
@@ -4453,6 +4642,43 @@ mod tests {
         };
         let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs { act, .. }) = sub;
         assert!(act);
+    }
+
+    #[test]
+    fn process_issues_watch_parses_queue_controls() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "process",
+            "issues",
+            "watch",
+            "--repo",
+            "njfio/codex-process",
+            "--label",
+            "process:auto-fix",
+            "--act",
+            "--max-concurrency",
+            "3",
+            "--queue-delay-ms",
+            "400",
+            "--max-act-items",
+            "5",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Process(ProcessCli { sub, .. })) = cli.subcommand else {
+            panic!("expected process subcommand");
+        };
+        let ProcessSubcommand::Issues(ProcessIssuesCli { sub }) = sub else {
+            panic!("expected process issues");
+        };
+        let ProcessIssuesSubcommand::Watch(ProcessIssuesWatchArgs {
+            max_concurrency,
+            queue_delay_ms,
+            max_act_items,
+            ..
+        }) = sub;
+        assert_eq!(max_concurrency, 3);
+        assert_eq!(queue_delay_ms, 400);
+        assert_eq!(max_act_items, Some(5));
     }
 
     #[test]
@@ -4657,6 +4883,43 @@ mod tests {
             url: "https://github.com/openai/codex-process/issues/11".to_string(),
         });
         assert_eq!(decision, IssueWatchDecision::NeedsManual);
+    }
+
+    #[test]
+    fn build_process_issues_watch_act_queue_plan_acts_all_without_cap() {
+        let plan = build_process_issues_watch_act_queue_plan(3, None);
+        assert_eq!(
+            plan,
+            ProcessIssuesWatchActQueuePlan {
+                acted_indices: vec![0, 1, 2],
+                skipped: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_process_issues_watch_act_queue_plan_skips_over_cap() {
+        let plan = build_process_issues_watch_act_queue_plan(5, Some(2));
+        assert_eq!(
+            plan,
+            ProcessIssuesWatchActQueuePlan {
+                acted_indices: vec![0, 1],
+                skipped: vec![
+                    ProcessIssuesWatchActQueueSkippedIssue {
+                        issue_index: 2,
+                        reason: IssueWatchSkippedReason::MaxActItemsCapReached,
+                    },
+                    ProcessIssuesWatchActQueueSkippedIssue {
+                        issue_index: 3,
+                        reason: IssueWatchSkippedReason::MaxActItemsCapReached,
+                    },
+                    ProcessIssuesWatchActQueueSkippedIssue {
+                        issue_index: 4,
+                        reason: IssueWatchSkippedReason::MaxActItemsCapReached,
+                    }
+                ],
+            }
+        );
     }
 
     #[test]
