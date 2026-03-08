@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,12 +8,6 @@ from pathlib import Path
 import pytest
 
 from codex_app_server import Codex, TextInput
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("RUN_REAL_CODEX_TESTS") != "1" or shutil.which("codex") is None,
-    reason="Set RUN_REAL_CODEX_TESTS=1 and ensure `codex` is available",
-)
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = ROOT / "examples"
@@ -120,8 +113,7 @@ def test_real_turn_interrupt_smoke():
 
         # Confirm the session is still usable after interrupt race.
         follow_up = thread.turn(TextInput("Say 'ok' only.")).run()
-        assert follow_up.status in {"completed", "failed"}
-
+        assert follow_up.status.value in {"completed", "failed"}
 
 @pytest.mark.parametrize(("folder", "script"), EXAMPLE_CASES)
 def test_real_examples_run_and_assert(folder: str, script: str):
