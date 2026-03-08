@@ -196,6 +196,69 @@ class Codex:
             sourceKinds=source_kinds,
         )
         return self._client.thread_list(params)
+
+    def thread_resume(
+        self,
+        thread_id: str,
+        *,
+        approval_policy: ResumeAskForApproval | None = None,
+        base_instructions: str | None = None,
+        config: JsonObject | None = None,
+        cwd: str | None = None,
+        developer_instructions: str | None = None,
+        model: str | None = None,
+        model_provider: str | None = None,
+        personality: ResumePersonality | None = None,
+        sandbox: ResumeSandboxMode | None = None,
+    ) -> Thread:
+        params = ThreadResumeParams(
+            threadId=thread_id,
+            approvalPolicy=approval_policy,
+            baseInstructions=base_instructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developer_instructions,
+            model=model,
+            modelProvider=model_provider,
+            personality=personality,
+            sandbox=sandbox,
+        )
+        resumed = self._client.thread_resume(thread_id, params)
+        return Thread(self._client, resumed.thread.id)
+
+    def thread_fork(
+        self,
+        thread_id: str,
+        *,
+        approval_policy: ForkAskForApproval | None = None,
+        base_instructions: str | None = None,
+        config: JsonObject | None = None,
+        cwd: str | None = None,
+        developer_instructions: str | None = None,
+        model: str | None = None,
+        model_provider: str | None = None,
+        sandbox: ForkSandboxMode | None = None,
+    ) -> Thread:
+        params = ThreadForkParams(
+            threadId=thread_id,
+            approvalPolicy=approval_policy,
+            baseInstructions=base_instructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developer_instructions,
+            model=model,
+            modelProvider=model_provider,
+            sandbox=sandbox,
+        )
+        forked = self._client.thread_fork(thread_id, params)
+        return Thread(self._client, forked.thread.id)
+
+    def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:
+        return self._client.thread_archive(thread_id)
+
+    def thread_unarchive(self, thread_id: str) -> Thread:
+        unarchived = self._client.thread_unarchive(thread_id)
+        return Thread(self._client, unarchived.thread.id)
     # END GENERATED: Codex.flat_methods
 
     def thread(self, thread_id: str) -> Thread:
@@ -294,6 +357,73 @@ class AsyncCodex:
             sourceKinds=source_kinds,
         )
         return await self._client.thread_list(params)
+
+    async def thread_resume(
+        self,
+        thread_id: str,
+        *,
+        approval_policy: ResumeAskForApproval | None = None,
+        base_instructions: str | None = None,
+        config: JsonObject | None = None,
+        cwd: str | None = None,
+        developer_instructions: str | None = None,
+        model: str | None = None,
+        model_provider: str | None = None,
+        personality: ResumePersonality | None = None,
+        sandbox: ResumeSandboxMode | None = None,
+    ) -> AsyncThread:
+        await self._ensure_initialized()
+        params = ThreadResumeParams(
+            threadId=thread_id,
+            approvalPolicy=approval_policy,
+            baseInstructions=base_instructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developer_instructions,
+            model=model,
+            modelProvider=model_provider,
+            personality=personality,
+            sandbox=sandbox,
+        )
+        resumed = await self._client.thread_resume(thread_id, params)
+        return AsyncThread(self, resumed.thread.id)
+
+    async def thread_fork(
+        self,
+        thread_id: str,
+        *,
+        approval_policy: ForkAskForApproval | None = None,
+        base_instructions: str | None = None,
+        config: JsonObject | None = None,
+        cwd: str | None = None,
+        developer_instructions: str | None = None,
+        model: str | None = None,
+        model_provider: str | None = None,
+        sandbox: ForkSandboxMode | None = None,
+    ) -> AsyncThread:
+        await self._ensure_initialized()
+        params = ThreadForkParams(
+            threadId=thread_id,
+            approvalPolicy=approval_policy,
+            baseInstructions=base_instructions,
+            config=config,
+            cwd=cwd,
+            developerInstructions=developer_instructions,
+            model=model,
+            modelProvider=model_provider,
+            sandbox=sandbox,
+        )
+        forked = await self._client.thread_fork(thread_id, params)
+        return AsyncThread(self, forked.thread.id)
+
+    async def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:
+        await self._ensure_initialized()
+        return await self._client.thread_archive(thread_id)
+
+    async def thread_unarchive(self, thread_id: str) -> AsyncThread:
+        await self._ensure_initialized()
+        unarchived = await self._client.thread_unarchive(thread_id)
+        return AsyncThread(self, unarchived.thread.id)
     # END GENERATED: AsyncCodex.flat_methods
 
     def thread(self, thread_id: str) -> AsyncThread:
@@ -338,71 +468,10 @@ class Thread:
         )
         turn = self._client.turn_start(self.id, wire_input, params=params)
         return Turn(self._client, self.id, turn.turn.id)
-
-    def resume(
-        self,
-        *,
-        approval_policy: ResumeAskForApproval | None = None,
-        base_instructions: str | None = None,
-        config: JsonObject | None = None,
-        cwd: str | None = None,
-        developer_instructions: str | None = None,
-        model: str | None = None,
-        model_provider: str | None = None,
-        personality: ResumePersonality | None = None,
-        sandbox: ResumeSandboxMode | None = None,
-    ) -> Thread:
-        params = ThreadResumeParams(
-            threadId=self.id,
-            approvalPolicy=approval_policy,
-            baseInstructions=base_instructions,
-            config=config,
-            cwd=cwd,
-            developerInstructions=developer_instructions,
-            model=model,
-            modelProvider=model_provider,
-            personality=personality,
-            sandbox=sandbox,
-        )
-        resumed = self._client.thread_resume(self.id, params)
-        return Thread(self._client, resumed.thread.id)
-
-    def fork(
-        self,
-        *,
-        approval_policy: ForkAskForApproval | None = None,
-        base_instructions: str | None = None,
-        config: JsonObject | None = None,
-        cwd: str | None = None,
-        developer_instructions: str | None = None,
-        model: str | None = None,
-        model_provider: str | None = None,
-        sandbox: ForkSandboxMode | None = None,
-    ) -> Thread:
-        params = ThreadForkParams(
-            threadId=self.id,
-            approvalPolicy=approval_policy,
-            baseInstructions=base_instructions,
-            config=config,
-            cwd=cwd,
-            developerInstructions=developer_instructions,
-            model=model,
-            modelProvider=model_provider,
-            sandbox=sandbox,
-        )
-        forked = self._client.thread_fork(self.id, params)
-        return Thread(self._client, forked.thread.id)
     # END GENERATED: Thread.flat_methods
 
     def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
         return self._client.thread_read(self.id, include_turns=include_turns)
-
-    def archive(self) -> ThreadArchiveResponse:
-        return self._client.thread_archive(self.id)
-
-    def unarchive(self) -> Thread:
-        unarchived = self._client.thread_unarchive(self.id)
-        return Thread(self._client, unarchived.thread.id)
 
     def set_name(self, name: str) -> ThreadSetNameResponse:
         return self._client.thread_set_name(self.id, name)
@@ -450,76 +519,11 @@ class AsyncThread:
             params=params,
         )
         return AsyncTurn(self._codex, self.id, turn.turn.id)
-
-    async def resume(
-        self,
-        *,
-        approval_policy: ResumeAskForApproval | None = None,
-        base_instructions: str | None = None,
-        config: JsonObject | None = None,
-        cwd: str | None = None,
-        developer_instructions: str | None = None,
-        model: str | None = None,
-        model_provider: str | None = None,
-        personality: ResumePersonality | None = None,
-        sandbox: ResumeSandboxMode | None = None,
-    ) -> AsyncThread:
-        await self._codex._ensure_initialized()
-        params = ThreadResumeParams(
-            threadId=self.id,
-            approvalPolicy=approval_policy,
-            baseInstructions=base_instructions,
-            config=config,
-            cwd=cwd,
-            developerInstructions=developer_instructions,
-            model=model,
-            modelProvider=model_provider,
-            personality=personality,
-            sandbox=sandbox,
-        )
-        resumed = await self._codex._client.thread_resume(self.id, params)
-        return AsyncThread(self._codex, resumed.thread.id)
-
-    async def fork(
-        self,
-        *,
-        approval_policy: ForkAskForApproval | None = None,
-        base_instructions: str | None = None,
-        config: JsonObject | None = None,
-        cwd: str | None = None,
-        developer_instructions: str | None = None,
-        model: str | None = None,
-        model_provider: str | None = None,
-        sandbox: ForkSandboxMode | None = None,
-    ) -> AsyncThread:
-        await self._codex._ensure_initialized()
-        params = ThreadForkParams(
-            threadId=self.id,
-            approvalPolicy=approval_policy,
-            baseInstructions=base_instructions,
-            config=config,
-            cwd=cwd,
-            developerInstructions=developer_instructions,
-            model=model,
-            modelProvider=model_provider,
-            sandbox=sandbox,
-        )
-        forked = await self._codex._client.thread_fork(self.id, params)
-        return AsyncThread(self._codex, forked.thread.id)
     # END GENERATED: AsyncThread.flat_methods
 
     async def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
         await self._codex._ensure_initialized()
         return await self._codex._client.thread_read(self.id, include_turns=include_turns)
-
-    async def archive(self) -> ThreadArchiveResponse:
-        await self._codex._ensure_initialized()
-        return await self._codex._client.thread_archive(self.id)
-
-    async def unarchive(self) -> AsyncThread:
-        await self._codex._ensure_initialized()
-        unarchived = await self._codex._client.thread_unarchive(self.id)
-        return AsyncThread(self._codex, unarchived.thread.id)
 
     async def set_name(self, name: str) -> ThreadSetNameResponse:
         await self._codex._ensure_initialized()

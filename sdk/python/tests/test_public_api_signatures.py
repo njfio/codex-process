@@ -58,6 +58,27 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "sort_key",
             "source_kinds",
         ],
+        Codex.thread_resume: [
+            "approval_policy",
+            "base_instructions",
+            "config",
+            "cwd",
+            "developer_instructions",
+            "model",
+            "model_provider",
+            "personality",
+            "sandbox",
+        ],
+        Codex.thread_fork: [
+            "approval_policy",
+            "base_instructions",
+            "config",
+            "cwd",
+            "developer_instructions",
+            "model",
+            "model_provider",
+            "sandbox",
+        ],
         Thread.turn: [
             "approval_policy",
             "cwd",
@@ -67,27 +88,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "personality",
             "sandbox_policy",
             "summary",
-        ],
-        Thread.resume: [
-            "approval_policy",
-            "base_instructions",
-            "config",
-            "cwd",
-            "developer_instructions",
-            "model",
-            "model_provider",
-            "personality",
-            "sandbox",
-        ],
-        Thread.fork: [
-            "approval_policy",
-            "base_instructions",
-            "config",
-            "cwd",
-            "developer_instructions",
-            "model",
-            "model_provider",
-            "sandbox",
         ],
         AsyncCodex.thread_start: [
             "approval_policy",
@@ -110,6 +110,27 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "sort_key",
             "source_kinds",
         ],
+        AsyncCodex.thread_resume: [
+            "approval_policy",
+            "base_instructions",
+            "config",
+            "cwd",
+            "developer_instructions",
+            "model",
+            "model_provider",
+            "personality",
+            "sandbox",
+        ],
+        AsyncCodex.thread_fork: [
+            "approval_policy",
+            "base_instructions",
+            "config",
+            "cwd",
+            "developer_instructions",
+            "model",
+            "model_provider",
+            "sandbox",
+        ],
         AsyncThread.turn: [
             "approval_policy",
             "cwd",
@@ -120,31 +141,38 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "sandbox_policy",
             "summary",
         ],
-        AsyncThread.resume: [
-            "approval_policy",
-            "base_instructions",
-            "config",
-            "cwd",
-            "developer_instructions",
-            "model",
-            "model_provider",
-            "personality",
-            "sandbox",
-        ],
-        AsyncThread.fork: [
-            "approval_policy",
-            "base_instructions",
-            "config",
-            "cwd",
-            "developer_instructions",
-            "model",
-            "model_provider",
-            "sandbox",
-        ],
     }
 
     for fn, expected_kwargs in expected.items():
         actual = _keyword_only_names(fn)
         assert actual == expected_kwargs, f"unexpected kwargs for {fn}: {actual}"
         assert all(name == name.lower() for name in actual), f"non snake_case kwargs in {fn}: {actual}"
+        _assert_no_any_annotations(fn)
+
+
+def test_lifecycle_methods_are_codex_scoped() -> None:
+    assert hasattr(Codex, "thread_resume")
+    assert hasattr(Codex, "thread_fork")
+    assert hasattr(Codex, "thread_archive")
+    assert hasattr(Codex, "thread_unarchive")
+    assert hasattr(AsyncCodex, "thread_resume")
+    assert hasattr(AsyncCodex, "thread_fork")
+    assert hasattr(AsyncCodex, "thread_archive")
+    assert hasattr(AsyncCodex, "thread_unarchive")
+
+    assert not hasattr(Thread, "resume")
+    assert not hasattr(Thread, "fork")
+    assert not hasattr(Thread, "archive")
+    assert not hasattr(Thread, "unarchive")
+    assert not hasattr(AsyncThread, "resume")
+    assert not hasattr(AsyncThread, "fork")
+    assert not hasattr(AsyncThread, "archive")
+    assert not hasattr(AsyncThread, "unarchive")
+
+    for fn in (
+        Codex.thread_archive,
+        Codex.thread_unarchive,
+        AsyncCodex.thread_archive,
+        AsyncCodex.thread_unarchive,
+    ):
         _assert_no_any_annotations(fn)

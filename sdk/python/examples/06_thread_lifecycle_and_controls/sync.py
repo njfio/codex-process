@@ -11,13 +11,17 @@ with Codex() as codex:
     reading = reopened.read(include_turns=True)
 
     _ = reopened.set_name("sdk-lifecycle-demo")
-    _ = reopened.archive()
+    _ = codex.thread_archive(reopened.id)
     listing_archived = codex.thread_list(limit=20, archived=True)
-    unarchived = reopened.unarchive()
+    unarchived = codex.thread_unarchive(reopened.id)
 
     resumed_info = "n/a"
     try:
-        resumed = unarchived.resume(model="gpt-5", config={"model_reasoning_effort": "high"})
+        resumed = codex.thread_resume(
+            unarchived.id,
+            model="gpt-5",
+            config={"model_reasoning_effort": "high"},
+        )
         resumed_result = resumed.turn(TextInput("Continue in one short sentence.")).run()
         resumed_info = f"{resumed_result.turn_id} {resumed_result.status}"
     except Exception as exc:
@@ -25,7 +29,7 @@ with Codex() as codex:
 
     forked_info = "n/a"
     try:
-        forked = unarchived.fork(model="gpt-5")
+        forked = codex.thread_fork(unarchived.id, model="gpt-5")
         forked_result = forked.turn(TextInput("Take a different angle in one short sentence.")).run()
         forked_info = f"{forked_result.turn_id} {forked_result.status}"
     except Exception as exc:

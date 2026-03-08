@@ -36,12 +36,12 @@ If you are migrating older code, update these names:
 - `outputSchema` -> `output_schema`
 - `sandboxPolicy` -> `sandbox_policy`
 
-## `thread(...)` vs `thread.resume(...)`
+## `thread(...)` vs `thread_resume(...)`
 
 - `codex.thread(thread_id)` binds a helper to an existing thread ID.
-- `thread.resume(...)` performs an explicit `thread/resume` RPC and returns the resumed thread.
+- `codex.thread_resume(thread_id, ...)` performs an explicit `thread/resume` RPC and returns the resumed thread.
 
-Use `thread(...)` for simple continuation. Use `resume(...)` when you need explicit resume semantics or overrides.
+Use `thread(...)` for simple continuation. Use `thread_resume(...)` when you need explicit resume semantics or overrides.
 
 ## Why does constructor fail?
 

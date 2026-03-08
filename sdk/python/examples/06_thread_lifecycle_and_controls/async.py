@@ -14,13 +14,17 @@ async def main() -> None:
         reading = await reopened.read(include_turns=True)
 
         _ = await reopened.set_name("sdk-lifecycle-demo")
-        _ = await reopened.archive()
+        _ = await codex.thread_archive(reopened.id)
         listing_archived = await codex.thread_list(limit=20, archived=True)
-        unarchived = await reopened.unarchive()
+        unarchived = await codex.thread_unarchive(reopened.id)
 
         resumed_info = "n/a"
         try:
-            resumed = await unarchived.resume(model="gpt-5", config={"model_reasoning_effort": "high"})
+            resumed = await codex.thread_resume(
+                unarchived.id,
+                model="gpt-5",
+                config={"model_reasoning_effort": "high"},
+            )
             resumed_result = await (await resumed.turn(TextInput("Continue in one short sentence."))).run()
             resumed_info = f"{resumed_result.turn_id} {resumed_result.status}"
         except Exception as exc:
@@ -28,7 +32,7 @@ async def main() -> None:
 
         forked_info = "n/a"
         try:
-            forked = await unarchived.fork(model="gpt-5")
+            forked = await codex.thread_fork(unarchived.id, model="gpt-5")
             forked_result = await (await forked.turn(TextInput("Take a different angle in one short sentence."))).run()
             forked_info = f"{forked_result.turn_id} {forked_result.status}"
         except Exception as exc:
