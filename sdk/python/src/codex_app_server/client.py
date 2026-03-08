@@ -363,14 +363,14 @@ class AppServerClient:
 
     def thread_set_name(self, thread_id: str, name: str) -> ThreadSetNameResponse:
         return self.request(
-            "thread/setName",
+            "thread/name/set",
             {"threadId": thread_id, "name": name},
             response_model=ThreadSetNameResponse,
         )
 
     def thread_compact(self, thread_id: str) -> ThreadCompactStartResponse:
         return self.request(
-            "thread/compact",
+            "thread/compact/start",
             {"threadId": thread_id},
             response_model=ThreadCompactStartResponse,
         )

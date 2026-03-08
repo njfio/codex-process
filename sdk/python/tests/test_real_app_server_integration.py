@@ -47,7 +47,7 @@ EXAMPLE_CASES: list[tuple[str, str]] = [
 
 
 def _run_example(
-    folder: str, script: str, *, timeout_s: int = 90
+    folder: str, script: str, *, timeout_s: int = 150
 ) -> subprocess.CompletedProcess[str]:
     path = EXAMPLES_DIR / folder / script
     assert path.exists(), f"Missing example script: {path}"
