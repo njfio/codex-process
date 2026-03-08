@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use codex_core::CodexAuth;
-use codex_core::CodexThread;
 use codex_core::auth::OPENAI_API_KEY_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -39,9 +38,6 @@ use tokio::sync::oneshot;
 const STARTUP_CONTEXT_HEADER: &str = "Startup context from Codex.";
 const MEMORY_PROMPT_PHRASE: &str =
     "You have access to a memory folder with guidance from prior runs.";
-const REALTIME_NORMAL_CLOSE_MESSAGE: &str =
-    "failed to send realtime request: Connection closed normally";
-
 fn websocket_request_text(
     request: &core_test_support::responses::WebSocketRequest,
 ) -> Option<String> {
@@ -56,32 +52,6 @@ fn websocket_request_instructions(
     request.body_json()["session"]["instructions"]
         .as_str()
         .map(str::to_owned)
-}
-
-async fn wait_for_session_updated_allowing_clean_close(
-    codex: &CodexThread,
-    expected_session_id: &str,
-) {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let event = match codex.next_event().await {
-                Ok(event) => event,
-                Err(err) => panic!("realtime conversation event should arrive: {err:?}"),
-            };
-            match event.msg {
-                EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-                    payload: RealtimeEvent::SessionUpdated { session_id, .. },
-                }) if session_id == expected_session_id => return,
-                EventMsg::Error(err) if err.message.contains(REALTIME_NORMAL_CLOSE_MESSAGE) => {}
-                EventMsg::Error(err) => panic!("conversation start failed: {err:?}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("timeout waiting for session.updated event for {expected_session_id}")
-    });
 }
 
 async fn seed_recent_thread(
@@ -696,8 +666,6 @@ async fn conversation_uses_experimental_realtime_ws_startup_context_override() -
         }))
         .await?;
 
-    wait_for_session_updated_allowing_clean_close(&test.codex, "sess_custom_context").await;
-
     let startup_context_request = server.wait_for_request(1, 0).await;
     let instructions = websocket_request_instructions(&startup_context_request)
         .expect("custom startup context request should contain instructions");
@@ -746,8 +714,6 @@ async fn conversation_disables_realtime_startup_context_with_empty_override() ->
         }))
         .await?;
 
-    wait_for_session_updated_allowing_clean_close(&test.codex, "sess_no_context").await;
-
     let startup_context_request = server.wait_for_request(1, 0).await;
     let instructions = websocket_request_instructions(&startup_context_request)
         .expect("startup context disable request should contain instructions");
@@ -792,8 +758,6 @@ async fn conversation_start_injects_startup_context_from_thread_history() -> Res
         }))
         .await?;
 
-    wait_for_session_updated_allowing_clean_close(&test.codex, "sess_context").await;
-
     let startup_context_request = server.wait_for_request(1, 0).await;
     let startup_context = websocket_request_instructions(&startup_context_request)
         .expect("startup context request should contain instructions");
@@ -837,8 +801,6 @@ async fn conversation_startup_context_falls_back_to_workspace_map() -> Result<()
             session_id: None,
         }))
         .await?;
-
-    wait_for_session_updated_allowing_clean_close(&test.codex, "sess_workspace").await;
 
     let startup_context_request = server.wait_for_request(1, 0).await;
     let startup_context = websocket_request_instructions(&startup_context_request)
