@@ -99,6 +99,14 @@ The `issues watch` subcommand fetches matching open issues and writes `.process/
 With `--act`, `issues watch` triages each issue (`quick_fix` or `needs_manual`) and isolates each quick-fix attempt so one issue failure does not abort the rest. Matching issues are first queued and then started with bounded concurrency (`--max-concurrency`, default `1`) plus inter-start throttling (`--queue-delay-ms`, default `250`) to reduce GitHub/git bursts. Use `--max-act-items` to cap how many queued issues are acted on in a run (remaining issues are recorded as skipped with an explicit reason). Successful quick-fix attempts run targeted `codex exec` in an isolated worktree branch, commit/push changes, open a follow-up PR, and post a status comment back on the issue via `gh issue comment`. Non-successful attempts post a concise manual-follow-up comment with the failure reason. `--act --dry-run` keeps ingestion/triage/queue planning but skips all mutation steps. Action runs write `.process/runs/<run-id>/issues-watch-act.json` with run-level fields `operationId`, `dryRun`, `guardrails`, `fetchedAt`, `repo`, `label`, `maxConcurrency`, `queueDelayMs`, `maxActItems`, `actedCount`, `skippedCount`, `duplicateCount`, `dedupeKeysMatched[]`, and per-issue `issueActions[]` entries: `issueNumber`, `issueUrl`, `decision`, `plannedAction`, `skippedReasons[]`, `attempted`, `success`, `branch`, `commitSha`, `commitUrl`, `prUrl`, `prNumber`, `updateCommentUrl`, and `error`.
 `gh` process-mode calls now retry transient API failures (including rate limiting/abuse/secondary-limit signals) with exponential backoff + jitter. Tune behavior with `--gh-max-attempts` (default `5`) and `--gh-base-backoff-ms` (default `500`).
 
+## Dashboard Roadmap (automation track)
+
+A separate dashboard plan for configuring schedules/repos and monitoring process jobs is documented at:
+
+- `docs/dashboard-mvp.md`
+
+This scope is explicitly for `codex-process` / `nickdex` automation and excludes `autoresearch-rs`.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
