@@ -104,6 +104,7 @@ With `--act`, `issues watch` triages each issue (`quick_fix` or `needs_manual`) 
 A separate dashboard plan for configuring schedules/repos and monitoring process jobs is documented at:
 
 - `docs/dashboard-mvp.md`
+- `process-dashboard/README.md` (foundation service scaffold and local run steps)
 
 This scope is explicitly for `codex-process` / `nickdex` automation and excludes `autoresearch-rs`.
 
